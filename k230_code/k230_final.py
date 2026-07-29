@@ -229,9 +229,9 @@ STREAM_PROFILES = {
     # not add pipe-tick detail and are retained for comparison only.
     "clarity":     (480, 360, 12, 65),
     "quality":     (480, 360, 10, 75),
-    # 640x240 original-frame crop, Q80 @5fps: recommended single-camera
+    # 640x240 original-frame crop, Q80 @8fps: recommended single-camera
     # evidence stream while 320x240 vision/UART remains the control priority.
-    "pipe_detail": (640, 240, 5, 80),
+    "pipe_detail": (640, 240, 8, 80),
 }
 VIDEO_W, VIDEO_H, VIDEO_TARGET_FPS, JPEG_Q = STREAM_PROFILES[STREAM_PROFILE]
 VIDEO_INTERVAL_MS = max(1, 1000 // VIDEO_TARGET_FPS)

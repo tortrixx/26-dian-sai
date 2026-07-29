@@ -33,7 +33,7 @@ RECORD_DIR = r"C:\电赛录制"
 # one-pixel physical tick marks; the old 1.5x linear resize visibly blurred it.
 DISPLAY_SCALE = 2.0
 DISPLAY_INTERPOLATION = cv2.INTER_NEAREST
-RECORD_FPS = 5  # Match K230 STREAM_PROFILE="pipe_detail".
+RECORD_FPS = 8  # Match K230 STREAM_PROFILE="pipe_detail".
 MAX_RECORD_QUEUE = 4
 # Use PyAV for MP4 recording.  The installed OpenCV wheel can decode video but
 # has no usable VideoWriter encoder on this PC; PyAV includes a working x264
