@@ -205,10 +205,10 @@ UART_RX = 10
 
 # Wi-Fi is display/recording only.  Socket attempts are short and rate-limited
 # so absence of a PC cannot stall ball detection or the control UART.
-# Fill these two values locally before deployment.  Do not commit a real
-# hotspot credential to the repository or include it in logs/screenshots.
-WIFI_SSID = "YOUR_HOTSPOT_SSID"
-WIFI_PASS = "YOUR_HOTSPOT_PASSWORD"
+# Project test hotspot configuration. The repository owner has explicitly
+# approved tracking this credential for direct K230 deployment.
+WIFI_SSID = "test"
+WIFI_PASS = "90z5M92#"
 PC_IP = "192.168.137.1"
 PC_PORT = 8888
 MAGIC = b'\xA5\x5A\xA5\x5A'
