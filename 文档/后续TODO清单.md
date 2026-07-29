@@ -1,6 +1,6 @@
 # 后续 TODO 清单
 
-> 当前交接入口：[今日完整交接与开发日志.md](2026-07-29_完整交接与开发日志.md)，其次为 [当前状态与交接.md](当前状态与交接.md)。
+> 当前交接入口：[README.md](README.md)。
 >
 > 控制基线：K230 以 `640×480` 保留完整管子视场，内部缩放至 `320×240` 做传统视觉与 UART。图传已实测为原始帧 `640×240` 管子带、JPEG `Q80/目标 8 FPS`；K230 `Loop 25.7–26.7 FPS`、图传 `6.8–8.2 FPS`。真实 1 cm 钢球已完成台架五点首测，当前位置模型采用五点分段插值；相机最终装车后必须重新复验。
 
@@ -41,7 +41,7 @@
 ## P0：Ti / MG996 硬件适配（可与视觉标定并行）
 
 - [ ] **合入控制骨架**
-  - 将 `firmware_state_machine_skeleton.c` 合入实际 MSPM0/Ti 工程。
+  - 将 `../ti_reference/firmware_state_machine_skeleton.c` 合入实际 MSPM0/Ti 工程。
   - 实现 `platform_set_beam_enable(bool)`、`platform_servo_write_us(uint16_t)`。
   - UART RX 中断/DMA 调用 `app_uart_rx_bytes(data,length,now_ms)`；100 Hz 任务调用 `app_update(now_ms,0.01f)`。
   - 交付：可编译 Ti 工程、UART 收包计数、50 Hz PWM 示波器截图。
@@ -92,7 +92,7 @@
 
 ## 向下一位 agent 提供的最小信息包
 
-1. 本文件和 `当前状态与交接.md`。
+1. 本文件和 `README.md`。
 2. `k230_final.py` 当前配置段的完整截图/副本。
 3. K230 启动日志与连续 5 行性能日志。
 4. 五点标定数据（钢球到位后）。
