@@ -5,7 +5,7 @@ wlan = network.WLAN(network.STA_IF)
 print("active:", wlan.active())
 
 SSID = "test"
-PASS = "90z5M92#"
+PASS = "YOUR_HOTSPOT_PASSWORD"
 
 print("connect to:", SSID)
 wlan.connect(SSID, PASS)

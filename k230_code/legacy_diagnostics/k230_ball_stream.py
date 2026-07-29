@@ -21,7 +21,7 @@ except: pass
 # ========== 配置 ==========
 # WiFi 图传
 WIFI_SSID     = "test"
-WIFI_PASS     = "90z5M92#"
+WIFI_PASS     = "YOUR_HOTSPOT_PASSWORD"
 PC_IP         = "192.168.137.1"
 PC_PORT       = 8888
 FRAME_MAGIC   = b'\xA5\x5A\xA5\x5A'
