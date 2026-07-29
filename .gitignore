@@ -1,0 +1,11 @@
+# Python and MicroPython build/runtime caches
+__pycache__/
+*.py[cod]
+
+# PC-side recordings and diagnostic captures are generated locally.
+record_*.mp4
+record_*.avi
+*.h264
+
+# VS Code local workspace state
+.vscode/*.log

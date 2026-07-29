@@ -1,0 +1,10 @@
+date,time,owner,item,run_no,mode,target_cm,run_time_s,lap_time_s,ab_time_s,stop_error_cm,max_ball_error_cm,final_ball_error_cm,vision_noise_cm,success,notes
+2026-07-29,,A,底盘循迹,1,LINE_STOP,, , , , , , , , ,
+2026-07-29,,B,静态滚球,1,STATIC_BALL,5, , , , , , , , ,
+2026-07-29,,B,静态滚球,2,STATIC_BALL,-5, , , , , , , , ,
+2026-07-29,,A+B,动态AB,1,DYN_AB,0, , , , , , , , ,
+2026-07-30,,A+B,整圈中心,1,DYN_LAP_CENTER,0, , , , , , , , ,
+2026-07-31,,A+B,整圈指定点,1,DYN_LAP_TARGET,5, , , , , , , , ,
+2026-07-29,,B,K230全视场视觉图传基线,1,VISION_BASELINE,0,,,,,,, ,yes,"GC2093 640x480 full-FOV -> internal 320x240; STREAM_PROFILE=control; JPEG Q70 target 8fps; Loop 23.4-27.3fps; Video 6.6-7.8fps; net 0.1-0.3ms; no recent socket stall"
+2026-07-29,,B,K230直接QVGA性能对比,1,VISION_BENCH,0,,,,,,, ,yes,"Direct 320x240 sensor output reached Loop 37.7-39.0fps but narrowed useful pipe FOV; not used for final mounting"
+2026-07-29,,B,真实钢球台架五点首测,1,VISION_CAL,0,,,,,,,,partial,"1 cm raw steel ball; stable cx=(47.19,102.57,160.47,221.28,270.67) maps to (-10,-5,0,+5,+10) cm by piecewise interpolation; area about 63..100px; final vehicle-mounted recalibration still required"
