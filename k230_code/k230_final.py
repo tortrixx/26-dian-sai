@@ -160,6 +160,12 @@ MIN_QUALITY = 50
 # dark pipe seam and bright pipe surface one large foreground region, hiding a
 # steel ball that is otherwise visible to the camera.
 SEPARATE_BRIGHT_DARK_BLOBS = True
+# Once a ball has been tracked, its current bright/dark appearance normally
+# persists for several frames.  Search that polarity first to avoid doing two
+# expensive find_blobs() passes per control frame.  A miss or weak candidate
+# immediately falls back to both polarities in the *same* frame.
+TRACK_POLARITY_FAST_PATH = True
+TRACK_POLARITY_FAST_MIN_QUALITY = 65
 
 # Real-ball calibration helper.  Keep this False for normal operation.  When
 # enabled, place the stationary ball at one known physical mark, set the label
@@ -442,24 +448,82 @@ def _diagnose_candidates(img, candidates, bright_threshold, dark_threshold,
                 pass
 
 
-def _find_best_blob(img, roi, predicted_x, using_track_roi):
+def _choose_best_tagged_candidate(tagged_candidates, predicted_x,
+                                  using_track_roi):
+    """Return the best (blob, quality, polarity) from tagged Blob results."""
+    best = None
+    best_quality = -1
+    best_polarity = None
+    for blob, polarity in tagged_candidates:
+        quality = _candidate_quality(blob, predicted_x, using_track_roi)
+        if quality > best_quality:
+            best = blob
+            best_quality = quality
+            best_polarity = polarity
+    return best, best_quality, best_polarity
+
+
+def _find_best_blob(img, roi, predicted_x, using_track_roi,
+                    preferred_polarity=None):
     bright_threshold, dark_threshold = _adaptive_thresholds(img, roi)
+    bright_candidates = []
+    dark_candidates = []
+    candidates = []
+    tagged_candidates = []
+    bright_scanned = False
+    dark_scanned = False
     try:
         if SEPARATE_BRIGHT_DARK_BLOBS:
             # Do not OR the polarities into one foreground image: on the real
             # white/gray pipe this joined the complete pipe edge into a
             # 294x34-pixel blob and concealed the ball.
-            bright_candidates = img.find_blobs(
-                [bright_threshold], roi=roi,
-                pixels_threshold=MIN_BLOB_PIXELS,
-                area_threshold=MIN_BLOB_PIXELS, merge=False
-            )
-            dark_candidates = img.find_blobs(
-                [dark_threshold], roi=roi,
-                pixels_threshold=MIN_BLOB_PIXELS,
-                area_threshold=MIN_BLOB_PIXELS, merge=False
-            )
+            if (TRACK_POLARITY_FAST_PATH and using_track_roi and
+                    preferred_polarity in ("bright", "dark")):
+                if preferred_polarity == "bright":
+                    bright_candidates = img.find_blobs(
+                        [bright_threshold], roi=roi,
+                        pixels_threshold=MIN_BLOB_PIXELS,
+                        area_threshold=MIN_BLOB_PIXELS, merge=False
+                    )
+                    bright_scanned = True
+                else:
+                    dark_candidates = img.find_blobs(
+                        [dark_threshold], roi=roi,
+                        pixels_threshold=MIN_BLOB_PIXELS,
+                        area_threshold=MIN_BLOB_PIXELS, merge=False
+                    )
+                    dark_scanned = True
+                tagged_candidates = ([(blob, "bright") for blob in bright_candidates] +
+                                     [(blob, "dark") for blob in dark_candidates])
+                fast_best, fast_quality, fast_polarity = _choose_best_tagged_candidate(
+                    tagged_candidates, predicted_x, using_track_roi
+                )
+                if fast_quality >= TRACK_POLARITY_FAST_MIN_QUALITY:
+                    candidates = bright_candidates + dark_candidates
+                    _diagnose_candidates(
+                        img, candidates, bright_threshold, dark_threshold,
+                        predicted_x, using_track_roi,
+                        len(bright_candidates), len(dark_candidates)
+                    )
+                    return fast_best, fast_quality, fast_polarity
+
+            # First acquisition, a weak preferred result, or a changed ball
+            # reflection: inspect both polarities before declaring a miss.
+            if not bright_scanned:
+                bright_candidates = img.find_blobs(
+                    [bright_threshold], roi=roi,
+                    pixels_threshold=MIN_BLOB_PIXELS,
+                    area_threshold=MIN_BLOB_PIXELS, merge=False
+                )
+            if not dark_scanned:
+                dark_candidates = img.find_blobs(
+                    [dark_threshold], roi=roi,
+                    pixels_threshold=MIN_BLOB_PIXELS,
+                    area_threshold=MIN_BLOB_PIXELS, merge=False
+                )
             candidates = bright_candidates + dark_candidates
+            tagged_candidates = ([(blob, "bright") for blob in bright_candidates] +
+                                 [(blob, "dark") for blob in dark_candidates])
         else:
             # Kept only for performance comparison; not suitable for the
             # current reflective pipe/steel-ball scene.
@@ -470,27 +534,25 @@ def _find_best_blob(img, roi, predicted_x, using_track_roi):
             )
             bright_candidates = candidates
             dark_candidates = []
+            tagged_candidates = [(blob, "combined") for blob in candidates]
     except Exception:
         # Keep the safety path alive even on a firmware-specific image failure.
         candidates = []
         bright_candidates = []
         dark_candidates = []
+        tagged_candidates = []
 
     _diagnose_candidates(img, candidates, bright_threshold, dark_threshold,
                          predicted_x, using_track_roi,
                          len(bright_candidates), len(dark_candidates))
 
-    best = None
-    best_quality = -1
-    for blob in candidates:
-        quality = _candidate_quality(blob, predicted_x, using_track_roi)
-        if quality > best_quality:
-            best = blob
-            best_quality = quality
+    best, best_quality, best_polarity = _choose_best_tagged_candidate(
+        tagged_candidates, predicted_x, using_track_roi
+    )
 
     if best_quality < MIN_QUALITY:
-        return None, 0
-    return best, best_quality
+        return None, 0, None
+    return best, best_quality, best_polarity
 
 
 def _calibration_sample(blob, quality):
@@ -556,6 +618,7 @@ class AlphaBetaTracker:
         self.v = 0.0
         self.last_ms = 0
         self.misses = 0
+        self.polarity = None
 
     def predicted_x(self, now_ms):
         if not self.ready:
@@ -563,8 +626,10 @@ class AlphaBetaTracker:
         dt_s = _clamp(_ticks_diff(now_ms, self.last_ms) / 1000.0, 0.0, 0.25)
         return self.x + self.v * dt_s
 
-    def update(self, measured_x, now_ms):
+    def update(self, measured_x, now_ms, polarity=None):
         measured_x = float(measured_x)
+        if polarity is not None:
+            self.polarity = polarity
         if not self.ready:
             self.ready = True
             self.x = measured_x
@@ -602,7 +667,10 @@ def detect_ball(img, tracker, now_ms):
     else:
         search_roi = PIPE_ROI
 
-    best, quality = _find_best_blob(img, search_roi, predicted_x, tracked)
+    best, quality, polarity = _find_best_blob(
+        img, search_roi, predicted_x, tracked,
+        tracker.polarity if tracked else None
+    )
     if best is None:
         tracker.miss()
         _draw_overlay_text(img, 2, 2, "NO BALL ({})".format(tracker.misses),
@@ -610,7 +678,7 @@ def detect_ball(img, tracker, now_ms):
         return False, 0, 0, 0, tracked
 
     _calibration_sample(best, quality)
-    filtered_x_px = tracker.update(best.cx(), now_ms)
+    filtered_x_px = tracker.update(best.cx(), now_ms, polarity)
     x_cm = _pixel_to_cm(filtered_x_px)
     x_cm_x100 = int(round(x_cm * 100.0))
     y_offset_px = best.cy() - PIPE_CENTER_Y
