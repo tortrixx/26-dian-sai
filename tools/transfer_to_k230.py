@@ -14,12 +14,13 @@ BAUD = 115200
 
 # Files to transfer: (local_path, sdcard_path)
 FILES = [
-    # SD card root
-    (r"C:\Users\sznnn\Downloads\Google下载\yolo11n_det_320.kmodel",
-     "/sdcard/yolo11n_det_320.kmodel"),
-    # Libs
+    # Main script
     (r"C:\Users\sznnn\Desktop\26-dian-sai\k230_code\k230_yolo.py",
-     "/sdcard/k230_yolo.py"),
+     "/sdcard/app/k230_yolo.py"),
+    # Calibration script
+    (r"C:\Users\sznnn\Desktop\26-dian-sai\k230_code\k230_calibrate.py",
+     "/sdcard/app/k230_calibrate.py"),
+    # Libs
     (r"C:\Users\sznnn\Desktop\26-dian-sai\k230_code\libs\AIBase.py",
      "/sdcard/app/libs/AIBase.py"),
     (r"C:\Users\sznnn\Desktop\26-dian-sai\k230_code\libs\AI2D.py",

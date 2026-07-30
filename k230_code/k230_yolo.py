@@ -51,9 +51,9 @@ NMS_THRESH = 0.45
 MAX_BOXES = 10
 
 # ---- Vision / tracking ----
-# Pixel-to-cm calibration.  *** MUST BE RECALIBRATED for your camera mount! ***
-ZERO_X_PX = 320.0
-PX_PER_CM = 12.0
+# Pixel-to-cm calibration.  Calibrated 2026-07-31 with real steel ball.
+ZERO_X_PX = 345.0
+PX_PER_CM = 20.1
 PIPE_ROI = (0, 120, 640, 240)
 
 # Alpha-beta tracker
@@ -81,10 +81,10 @@ WIFI_PASS = "90z5M92#"
 PC_IP = "192.168.137.1"
 PC_PORT = 8888
 MAGIC = b'\xA5\x5A\xA5\x5A'
-VIDEO_CONNECT_TIMEOUT_S = 0.30
-VIDEO_STALL_TIMEOUT_MS = 1500
-WIFI_RETRY_MS = 5000
-PC_RETRY_MS = 2000
+VIDEO_CONNECT_TIMEOUT_S = 0.50
+VIDEO_STALL_TIMEOUT_MS = 3000
+WIFI_RETRY_MS = 8000
+PC_RETRY_MS = 3000
 
 # Streaming (JPEG over TCP)
 STREAM_PROFILE = "pipe_detail"
@@ -213,6 +213,7 @@ class VideoSender:
     def __init__(self):
         self._pending = None
         self._sent = 0
+        self._stall_count = 0
         self._start_ms = 0
 
     def enqueue_payload(self, codec, jpeg_bytes):
@@ -225,6 +226,10 @@ class VideoSender:
     def reset(self):
         self._pending = None
         self._sent = 0
+        self._stall_count = 0
+
+    def stall_count(self):
+        return self._stall_count
 
     def flush(self, sock, now_ms):
         if self._pending is None:
@@ -237,7 +242,6 @@ class VideoSender:
             header[0:4] = STREAM_MAGIC
             header[4] = STREAM_VERSION
             header[5] = codec
-            # 4-byte big-endian length (matches PC receiver unpack(">I"))
             header[6] = (length >> 24) & 0xFF
             header[7] = (length >> 16) & 0xFF
             header[8] = (length >> 8) & 0xFF
@@ -245,24 +249,38 @@ class VideoSender:
             self._buf = header + payload
             self._buf_len = len(self._buf)
         total_sent = 0
+        attempts = 0
+        max_attempts = 4  # don't spin forever in one flush call
         try:
-            while self._sent < self._buf_len:
-                chunk = min(1400, self._buf_len - self._sent)
+            while self._sent < self._buf_len and attempts < max_attempts:
+                chunk = min(512, self._buf_len - self._sent)
                 sent = sock.send(self._buf[self._sent:self._sent + chunk])
-                if sent <= 0:
-                    self._pending = None
-                    self._sent = 0
-                    return 0, True
-                self._sent += sent
-                total_sent += sent
+                if sent > 0:
+                    self._sent += sent
+                    total_sent += sent
+                    self._stall_count = 0  # reset on progress
+                    attempts += 1
+                elif sent == 0:
+                    # Non-blocking socket buffer full — try again next tick
+                    self._stall_count += 1
+                    break
+                else:
+                    # sent < 0 — socket error
+                    self._stall_count += 1
+                    break
+        except OSError:
+            # EAGAIN / EWOULDBLOCK — buffer full, try next tick
+            self._stall_count += 1
         except Exception:
-            self._pending = None
-            self._sent = 0
-            return 0, True
+            self._stall_count += 5  # hard error
         if self._sent >= self._buf_len:
             self._pending = None
             self._sent = 0
+            self._stall_count = 0
             return total_sent, False
+        # Stall threshold: only report as dead after ~3 seconds of failures
+        if self._stall_count > 60:
+            return total_sent, True
         return total_sent, False
 
 
@@ -548,12 +566,14 @@ while True:
             video_bytes += completed_bytes
             video_count += 1
         if connection_stalled:
-            print("[K230] video socket stalled; reconnecting")
+            print("[K230] video stalled ({}) — reconnect".format(
+                video_sender.stall_count()))
             try:
                 pc_sock.close()
             except Exception:
                 pass
             pc_sock = None
+            last_pc_attempt_ms = now_ms  # don't reconnect immediately
             video_sender.reset()
 
     # 6. Status & GC
@@ -565,7 +585,11 @@ while True:
             pass
 
     if frame_index % 30 == 0:
-        state = "x={:.2f}cm c={:.2f}".format(x_cm_x100 / 100.0, ball_conf) if ball_valid else "NO BALL"
+        if ball_valid:
+            state = "x={:.2f}cm cx={:.1f}px c={:.2f}".format(
+                x_cm_x100 / 100.0, ball_cx, ball_conf)
+        else:
+            state = "NO BALL"
         stat_elapsed_ms = max(1, _ticks_diff(now_ms, video_stat_start_ms))
         video_fps = video_count * 1000.0 / stat_elapsed_ms
         video_kb_s = video_bytes * 1000.0 / stat_elapsed_ms / 1024.0
