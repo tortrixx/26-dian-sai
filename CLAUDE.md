@@ -88,7 +88,7 @@
 
 ## 四、对我们方案的影响
 
-### 当前方案（2026-07-30 更新）
+### 当前方案（2026-07-31 更新）
 
 ```
 GC2093 → K230 YOLO11n NPU 钢球检测 → UART → MSPM0 舵机控制
@@ -103,32 +103,52 @@ PC 端仅接收显示 + 录屏（按 r 键）                                   
 | 模型 | yolo11n_det_320.kmodel（Laoguigui2 钢球专用，1类，3MB） |
 | 输入 | CHN_2 RGBP888 640×480 → AI2D letterbox pad + bilinear resize → 320×320 |
 | 初始化顺序 | **set_framesize → set_pixformat**（顺序错误触发 Yahboom v1.4.3 buf_init bug） |
+| 标定 | **ZERO_X_PX=345.0, PX_PER_CM=20.1**（2026-07-31 五点实机，最终相机位置） |
 | 置信度阈值 | 0.35（0.5 以上漏检严重） |
 | 推理速度 | ~30ms/帧（NPU 独立于 CPU） |
-| 总帧率 | ~22 FPS（含 JPEG 编码 + WiFi 推流） |
+| 总帧率 | **~26 FPS**（含 JPEG 编码 + WiFi 推流） |
 | 图传 FPS | ~5-6 FPS（JPEG Q=50 @ 640×240 pipe crop） |
 
 #### K23V 视频协议（关键！）
 - Header: `K23V` (4B) + version (1B) + codec (1B=JPEG) + **4-byte BE length**
-- 之前有 bug：发送 3byte 长度 + 1byte 未初始化 0 → PC 解析出 256x 大小的帧 → 永远不解码
+- **图传稳定性修复（2026-07-31）**：非阻塞 socket 在 TCP 缓冲区满时返回 0/OSError(EAGAIN)，旧代码直接断线。修复：512B chunks + 连续 60 次失败才判定断线 + 重连冷却 3s
 - PC 接收端：`pc_receiver/pc_receiver.py`，依赖 `opencv-python numpy`
+
+#### MSPM0 控制固件（ti_control/，已编写待编译）
+| 组件 | 细节 |
+|------|------|
+| 方案 | **纯视觉 PD，无 IMU**（MPU-6050 当前不可用） |
+| 入口 | `ti_control/msp_control.c` |
+| UART | PA9 (UART1 RX) ← K230 IO9 TX，AA 55 协议 |
+| PWM | PA6 (TIMG0 C0) → MG996 信号线，50Hz，1MHz 时钟 |
+| 控制周期 | 100Hz（TIMG4 中断），PD：Kp=0.80, Ki=0, Kd=0.15 |
+| 安全 | 200ms 视觉超时→限速回中、±8° 摆角限制、边缘救球 |
+| 调试 | UART0 (XDS110) 命令：m0-m5 切模式、t+5.0 设目标、pk/dk/ik 在线调参 |
+| 构建 | `cd ti_control && .\build.ps1` |
 
 #### 关键文件
 | 文件 | 用途 |
 |------|------|
 | `k230_code/k230_yolo.py` | 主程序：YOLO 检测 + WiFi 推流 + UART |
+| `k230_code/k230_calibrate.py` | 标定工具：含 WiFi 推流 + ROI 过滤 |
 | `k230_code/k230_final.py` | 备用：motion-based 检测器（无 NPU） |
-| `pc_receiver/pc_receiver.py` | PC 端接收 + 显示 + 录像 |
+| `pc_receiver/pc_receiver.py` | PC 端接收 + 显示 + 录像（按 r 录，q 退） |
+| `ti_control/msp_control.c` | MSPM0 完整控制固件 |
+| `ti_control/msp_control.syscfg` | MSPM0 外设配置 |
+| `ti_control/README.md` | MSPM0 接线、校准、命令参考 |
+| `ti_mpu6050_test/mpu6050.h` | MPU-6050 姿态估计 API（互补滤波 + 零偏标定） |
+| `ti_mpu6050_test/mpu6050.c` | MPU-6050 姿态估计实现 |
 | `k230_code/libs/` | K230 SDK 库文件（YOLO, AI2D, AIBase, etc.） |
 | `reference_code/laoguigui2/` | Laoguigui2 参考代码 + kmodel |
 | `tools/transfer_to_k230.py` | 串口文件传输脚本 |
 
 ### 风险点
 1. **同频 WiFi 干扰**：赛场多队同时用 2.4G，考虑 5.8G 图传模块作备选
-2. **全程误差 ≤1cm**：YOLO 检测精度依赖 pixel-to-cm 标定（PX_PER_CM 需实测）
+2. **全程误差 ≤1cm**：YOLO 检测精度依赖 pixel-to-cm 标定，**相机移动必须重新标定**
 3. **钢球脱落 = 失败**：防滚落挡片要做好
 4. **不允许场外处理回传**：PC 端只做录像
 5. **YOLO 模型是 1 类检测器**：只检测钢球，换其他模型需确认 class count 匹配
+6. **MSPM0 固件未编译验证**：SysConfig 生成和编译可能需调整路径/版本
 
 ### 编码注意事项
 - K230 传感器初始化：**必须先 set_framesize 再 set_pixformat**，否则 CHN_2 触发 buf_init
@@ -137,3 +157,6 @@ PC 端仅接收显示 + 录屏（按 r 键）                                   
 - 模型加载时 sensor 不要 run（避免 CHN_2 4 帧缓冲溢出）
 - 图传 JPEG Q=50 @ 640×240 crop 约 8KB/帧，5fps ≈ 40KB/s
 - 测试前关闭 K230 上除 WiFi 外的所有无线功能
+- K230 非阻塞 socket send() 可能返回 0 或 OSError——不要当作断线，重试即可
+- MSPM0 控制固件 UART 调试命令：`m2 t+5.0 go` 进入静态滚球模式
+- MSPM0 编译环境：CCS `C:\ti\ccs2100`，SDK `2.10.00.04`，TI Arm Clang `4.0.2.LTS`，SysConfig `1.26.2`
