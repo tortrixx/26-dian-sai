@@ -1,26 +1,32 @@
-"""K230 YOLO11 NPU steel-ball detector with JPEG WiFi streaming.
+"""K230 YOLO11 NPU steel-ball detector — PipeLine edition.
 
-Replaces the motion-based frame-differencing detector with YOLO11n running
-on the K230 NPU.  The NPU runs independently from the CPU, so ball detection
-does NOT compete with JPEG encoding or UART transmission.
+Based on Laoguigui2/K230- reference code.  Uses PipeLine for sensor management,
+which avoids the Yahboom v1.4.3 CHN_2 buf_init bug by calling set_framesize
+BEFORE set_pixformat.
 
 Architecture:
-  Sensor CHN_2 (RGB888) → YOLO11 NPU → ball (cx,cy,conf)
-  Sensor CHN_2 snapshot    → RGB565 → JPEG → TCP WiFi → PC receiver
-  Ball position            → UART   → MSPM0
+  PipeLine CHN_2 (RGBP888 640x360) → AI2D → YOLO11 NPU → ball detection
+  PipeLine CHN_0 (YUV420SP) → virtual display (IDE preview)
+  UART → MSPM0 ball position
+  JPEG (from CHN_2 → RGB565) → TCP WiFi → PC receiver
+
+Usage:
+  Copy to /sdcard/app/k230_yolo.py, run from CanMV IDE.
 
 Requires:
-  /sdcard/yolo11n_det_320.kmodel          # from Laoguigui2/K230-
-  /sdcard/app/libs/{AIBase,AI2D,PipeLine,Utils,YOLO}.py   # kendryte SDK
+  /sdcard/kmodel/yolo11n_det_320.kmodel   # steel-ball model (Laoguigui2)
+  /sdcard/app/libs/{AIBase,AI2D,PipeLine,Utils,YOLO}.py
 """
+import sys as _sys
+_sys.path.insert(0, '/sdcard/app')
 
-from libs.PipeLine import PipeLine, ScopedTiming
 from libs.YOLO import YOLO11
 from libs.Utils import *
 from media.sensor import *
 from media.display import *
+from media.media import *
 from machine import UART, FPIOA
-import image, time, network, socket, gc, uctypes
+import image, time, network, socket, gc, os
 
 # ---- 0. Clean up IDE media pipeline ----
 try:
@@ -34,25 +40,23 @@ except Exception:
 
 # ============ Configuration ============
 
-# ---- YOLO / NPU ----
-MODEL_PATH = "/sdcard/yolo11n_det_320.kmodel"
-LABELS = ["steel"]
-RGB888P_SIZE = [640, 480]       # AI camera resolution (full frame for streaming)
-MODEL_INPUT_SIZE = [320, 320]   # kmodel input
-DISPLAY_SIZE = [640, 480]       # virtual display = same as streaming frame
-CONF_THRESH = 0.4               # lower = more detections, more false positives
+# ---- YOLO / NPU (Laoguigui2 model — 1 class: steel ball) ----
+MODEL_PATH = "/sdcard/kmodel/yolo11n_det_320.kmodel"
+MODEL_LABELS = {0: 'steel'}       # dict format — 1 class
+MODEL_INPUT_SIZE = [320, 320]     # kmodel input
+RGB888P_SIZE = [640, 480]         # AI channel = full frame (no vertical crop)
+DISPLAY_SIZE = [640, 480]         # virtual display / JPEG frame size
+CONF_THRESH = 0.35                # lower threshold for more consistent detection
 NMS_THRESH = 0.45
 MAX_BOXES = 10
-YOLO_DEBUG = 0
 
 # ---- Vision / tracking ----
 # Pixel-to-cm calibration.  *** MUST BE RECALIBRATED for your camera mount! ***
-# These are PLACEHOLDER values.  See calibration procedure in k230_final.py.
-ZERO_X_PX = 320.0               # Ball at 0 cm = center of 640-wide frame
-PX_PER_CM = 12.0                # Approximate: 1cm ≈ 12px at this distance
-PIPE_ROI = (0, 120, 640, 240)   # x, y, w, h in 640x480 streaming frame
+ZERO_X_PX = 320.0
+PX_PER_CM = 12.0
+PIPE_ROI = (0, 120, 640, 240)
 
-# Alpha-beta tracker (same as k230_final.py)
+# Alpha-beta tracker
 TRACK_HALF_WIDTH_PX = 100
 MAX_TRACK_SPEED_PX_S = 700.0
 TRACK_MISS_LIMIT = 10
@@ -64,7 +68,7 @@ UART_BAUD = 115200
 UART_TX = 9
 UART_RX = 10
 
-# ---- Wire protocol (same as k230_final.py) ----
+# ---- Wire protocol ----
 PROTO_HEAD_0 = 0xAA
 PROTO_HEAD_1 = 0x55
 MSG_VISION_TARGET = 0x01
@@ -82,7 +86,7 @@ VIDEO_STALL_TIMEOUT_MS = 1500
 WIFI_RETRY_MS = 5000
 PC_RETRY_MS = 2000
 
-# Streaming (JPEG over TCP — proven stable)
+# Streaming (JPEG over TCP)
 STREAM_PROFILE = "pipe_detail"
 STREAM_PROFILES = {
     "control":     (320, 240, 8, 70),
@@ -90,21 +94,19 @@ STREAM_PROFILES = {
 }
 VIDEO_W, VIDEO_H, VIDEO_TARGET_FPS, JPEG_Q = STREAM_PROFILES[STREAM_PROFILE]
 VIDEO_INTERVAL_MS = max(1, 1000 // VIDEO_TARGET_FPS)
-PIPE_VIDEO_CROP = (0, 120, 640, 240)  # x, y, w, h in 640x480 raw frame
+PIPE_VIDEO_CROP = (0, 120, 640, 240)
 
-# K23V protocol for TCP
+# K23V protocol
 STREAM_MAGIC = b'K23V'
 STREAM_VERSION = 1
 STREAM_CODEC_JPEG = 1
 
-# Streaming overlay
 STREAM_OVERLAY_ENABLE = True
 STREAM_OVERLAY_BOX_COLOR = (255, 0, 0)
 STREAM_OVERLAY_CROSS_COLOR = (0, 255, 0)
 STREAM_OVERLAY_THICKNESS = 2
 STREAM_OVERLAY_CROSS_SIZE = 12
 
-OVERLAY_ENABLE = False
 PERFORMANCE_LOG = True
 VISION_ENABLE = True
 
@@ -147,7 +149,6 @@ def build_vision_frame(seq, valid, x_cm_x100, y_offset_px, quality=0, tracked=Fa
     _put_i16_le(payload, 1, x_cm_x100)
     _put_i16_le(payload, 3, y_offset_px)
     payload[5] = _clamp(quality, 0, 255)
-
     length = len(payload) + 2
     frame = bytearray(2 + 1 + length + 1)
     frame[0] = PROTO_HEAD_0
@@ -161,7 +162,6 @@ def build_vision_frame(seq, valid, x_cm_x100, y_offset_px, quality=0, tracked=Fa
     return frame
 
 def pixel_to_cm(px_x):
-    """Linear pixel-to-cm conversion.  Recalibrate after camera mount!"""
     return (px_x - ZERO_X_PX) / PX_PER_CM
 
 
@@ -210,7 +210,6 @@ class AlphaBetaTracker:
 # ============ Video sender ============
 
 class VideoSender:
-    """Non-blocking packetised sender.  One packet = one complete JPEG frame."""
     def __init__(self):
         self._pending = None
         self._sent = 0
@@ -238,9 +237,11 @@ class VideoSender:
             header[0:4] = STREAM_MAGIC
             header[4] = STREAM_VERSION
             header[5] = codec
-            header[6] = (length >> 16) & 0xFF
-            header[7] = (length >> 8) & 0xFF
-            header[8] = length & 0xFF
+            # 4-byte big-endian length (matches PC receiver unpack(">I"))
+            header[6] = (length >> 24) & 0xFF
+            header[7] = (length >> 16) & 0xFF
+            header[8] = (length >> 8) & 0xFF
+            header[9] = length & 0xFF
             self._buf = header + payload
             self._buf_len = len(self._buf)
         total_sent = 0
@@ -327,74 +328,105 @@ def send_ball(valid, x_cm_x100, y_offset_px, quality, tracked):
 
 # ============ Streaming overlay ============
 
-def _draw_stream_marker(canvas, marker, source_mode="capture_pipe",
-                        frame_w=640, frame_h=480):
+def _draw_stream_marker(canvas, marker, crop_offset=(0, 0)):
     if marker is None:
         return
     bx, by, bw, bh, cx, cy = marker
-    if source_mode == "capture_pipe":
-        # marker coords are in 640x480 sensor frame
-        canvas.draw_rectangle(bx, by, bw, bh,
-                              color=STREAM_OVERLAY_BOX_COLOR,
-                              thickness=STREAM_OVERLAY_THICKNESS)
-        canvas.draw_cross(int(cx), int(cy),
-                          color=STREAM_OVERLAY_CROSS_COLOR,
-                          size=STREAM_OVERLAY_CROSS_SIZE,
+    ox, oy = crop_offset
+    canvas.draw_rectangle(bx - ox, by - oy, bw, bh,
+                          color=STREAM_OVERLAY_BOX_COLOR,
                           thickness=STREAM_OVERLAY_THICKNESS)
+    canvas.draw_cross(int(cx - ox), int(cy - oy),
+                      color=STREAM_OVERLAY_CROSS_COLOR,
+                      size=STREAM_OVERLAY_CROSS_SIZE,
+                      thickness=STREAM_OVERLAY_THICKNESS)
 
 
 def encode_video_jpeg(capture_img, vision_marker=None):
-    """Crop pipe strip from full frame, draw overlay, return JPEG bytes."""
     pipe_crop = capture_img.copy(roi=PIPE_VIDEO_CROP)
-    canvas = pipe_crop
     if STREAM_OVERLAY_ENABLE and vision_marker is not None:
-        _draw_stream_marker(canvas, vision_marker, source_mode="capture_pipe",
-                            frame_w=640, frame_h=480)
-    return bytes(canvas.compress(quality=JPEG_Q))
+        _draw_stream_marker(pipe_crop, vision_marker,
+                            crop_offset=(PIPE_VIDEO_CROP[0], PIPE_VIDEO_CROP[1]))
+    return bytes(pipe_crop.compress(quality=JPEG_Q))
 
 
 # ============ Main ============
 
-print("[K230] YOLO11 steel-ball detector starting...")
+print("[K230] YOLO11 steel-ball detector (PipeLine edition)")
 
 # UART
-fpioa = FPIOA()
-fpioa.set_function(UART_TX, FPIOA.UART1_TXD)
-fpioa.set_function(UART_RX, FPIOA.UART1_RXD)
-uart = UART(UART.UART1, UART_BAUD, 8, 1, 0, UART_TX, UART_RX)
-print("[K230] UART1 IO{}/IO{} {} baud OK".format(UART_TX, UART_RX, UART_BAUD))
+uart = None
+try:
+    fpioa = FPIOA()
+    fpioa.set_function(UART_TX, fpioa.UART1_TXD)
+    fpioa.set_function(UART_RX, fpioa.UART1_RXD)
+    uart = UART(UART.UART1, baudrate=UART_BAUD,
+                bits=UART.EIGHTBITS, parity=UART.PARITY_NONE,
+                stop=UART.STOPBITS_ONE)
+    print("[K230] UART1 IO{}/IO{} {} baud OK".format(UART_TX, UART_RX, UART_BAUD))
+except Exception as error:
+    print("[K230] UART unavailable:", error)
 
-# PipeLine: manages dual-channel sensor + virtual display.
-# CHN_0 (YUV420) → virtual display (Display.VIRT)
-# CHN_2 (RGB888) → AI processing
-pl = PipeLine(
-    rgb888p_size=RGB888P_SIZE,
-    display_mode="virt",
-    display_size=DISPLAY_SIZE,
-    debug_mode=0
-)
-pl.create(sensor_id=2)
-print("[K230] PipeLine created: AI {}x{} @ virt display {}x{}".format(
-    RGB888P_SIZE[0], RGB888P_SIZE[1], DISPLAY_SIZE[0], DISPLAY_SIZE[1]))
+# Sensor + Display — direct API, Laoguigui2 init order.
+# CRITICAL: set_framesize BEFORE set_pixformat avoids Yahboom v1.4.3 buf_init bug.
+# CHN_0 (default) → RGB565 → virtual display + JPEG streaming
+# CHN_2           → RGBP888 640x360 → AI2D → YOLO NPU
+print("[K230] Init camera (CHN_0 RGB565 640x480 + CHN_2 RGBP888 {}x{})...".format(
+    RGB888P_SIZE[0], RGB888P_SIZE[1]))
+try:
+    sensor = Sensor(id=2, width=640, height=480, fps=60)
+    sensor.reset()
+    # CHN_0: set_framesize BEFORE set_pixformat
+    sensor.set_framesize(w=DISPLAY_SIZE[0], h=DISPLAY_SIZE[1], chn=CAM_CHN_ID_0)
+    sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
+    print("[K230]   CHN_0 RGB565 {}x{}".format(
+        sensor.width(), sensor.height()))
+    # CHN_2: set_framesize BEFORE set_pixformat (Laoguigui2 order — no buf_init!)
+    sensor.set_framesize(w=RGB888P_SIZE[0], h=RGB888P_SIZE[1], chn=CAM_CHN_ID_2)
+    sensor.set_pixformat(Sensor.RGBP888, chn=CAM_CHN_ID_2)
+    print("[K230]   CHN_2 RGBP888 {}x{}".format(
+        sensor.width(chn=CAM_CHN_ID_2), sensor.height(chn=CAM_CHN_ID_2)))
+    # Virtual display
+    Display.init(Display.VIRT, DISPLAY_SIZE[0], DISPLAY_SIZE[1], to_ide=True)
+    MediaManager.init()
+    print("[K230]   Display VIRT {}x{} init ok".format(DISPLAY_SIZE[0], DISPLAY_SIZE[1]))
+except Exception as e:
+    print("[K230] CAMERA INIT FAILED:", e)
+    raise
 
-# YOLO11
-yolo = YOLO11(
-    task_type="detect",
-    mode="video",
-    kmodel_path=MODEL_PATH,
-    labels=LABELS,
-    rgb888p_size=RGB888P_SIZE,
-    model_input_size=MODEL_INPUT_SIZE,
-    display_size=DISPLAY_SIZE,
-    conf_thresh=CONF_THRESH,
-    nms_thresh=NMS_THRESH,
-    max_boxes_num=MAX_BOXES,
-    debug_mode=YOLO_DEBUG
-)
-yolo.config_preprocess()
-print("[K230] YOLO11 model loaded: {}".format(MODEL_PATH))
+# YOLO11 model — loaded BEFORE sensor.run() to keep CHN_2 buffers fresh.
+print("[K230] Loading YOLO11 steel-ball model (3 MB, ~15 s)...")
+try:
+    yolo = YOLO11(
+        task_type="detect",
+        mode="video",
+        kmodel_path=MODEL_PATH,
+        labels=MODEL_LABELS,
+        rgb888p_size=RGB888P_SIZE,
+        model_input_size=MODEL_INPUT_SIZE,
+        display_size=DISPLAY_SIZE,
+        conf_thresh=CONF_THRESH,
+        nms_thresh=NMS_THRESH,
+        max_boxes_num=MAX_BOXES,
+        debug_mode=0
+    )
+    yolo.config_preprocess()
+except Exception as e:
+    print("[K230] YOLO model load FAILED:", e)
+    raise
+print("[K230] YOLO11 model ready")
 
-# Streaming
+# Start sensor + warm up
+sensor.run()
+time.sleep_ms(600)
+for _ in range(8):
+    try:
+        sensor.snapshot(chn=CAM_CHN_ID_2)
+    except Exception:
+        time.sleep_ms(100)
+print("[K230] Sensor running, frames warm")
+
+# Streaming config
 print("[K230] Video pipe ROI {} -> {}x{} Q{} @{}fps".format(
     PIPE_VIDEO_CROP, VIDEO_W, VIDEO_H, JPEG_Q, VIDEO_TARGET_FPS))
 
@@ -414,22 +446,22 @@ video_stat_start_ms = time.ticks_ms()
 video_count = 0
 video_bytes = 0
 
-perf_capture_ms = 0
+perf_cap_ms = 0
 perf_yolo_ms = 0
 perf_jpeg_ms = 0
 perf_send_ms = 0
 
-print("[K230] Running: YOLO11 NPU -> UART; jpeg_cpu video")
+print("[K230] Running: YOLO NPU → UART; JPEG WiFi streaming")
 
 while True:
     clock.tick()
     now_ms = time.ticks_ms()
 
-    # 1. Get AI frame from sensor CHN_2 (RGB888)
+    # 1. Get AI frame from CHN_2 (RGBP888, 640x360)
     cap_start = time.ticks_ms()
-    ai_img = pl.sensor.snapshot(chn=CAM_CHN_ID_2)
+    ai_img = sensor.snapshot(chn=CAM_CHN_ID_2)
     ai_np = ai_img.to_numpy_ref()
-    perf_capture_ms += _ticks_diff(time.ticks_ms(), cap_start)
+    perf_cap_ms += _ticks_diff(time.ticks_ms(), cap_start)
 
     # 2. YOLO NPU inference
     yolo_start = time.ticks_ms()
@@ -437,29 +469,36 @@ while True:
     ball_cx = 0.0
     ball_cy = 0.0
     ball_conf = 0.0
-    results = []
+    box_w = 0
+    box_h = 0
     if VISION_ENABLE:
         try:
             results = yolo.run(ai_np)
         except Exception as e:
-            print("[K230] YOLO run error:", e)
-            results = []
-        # results format: [boxes_list, class_ids, scores]
-        # boxes_list[i] = [x, y, w, h] in display_size coords
-        if results:
+            # IDE interrupt or transient error — skip this frame
+            results = ([], [], [])
+        if results and results[0]:
+            # Log ALL detections for debugging
+            det_info = []
             best_idx = -1
             best_conf = 0.0
             for i in range(len(results[0])):
-                cls_id = int(results[1][i])
                 score = float(results[2][i])
-                if cls_id == 0 and score > best_conf:  # class 0 = steel
+                if score > CONF_THRESH:
+                    x, y, w, h = results[0][i]
+                    det_info.append("[{},{},{},{},c{}]".format(x,y,w,h,results[1][i]))
+                if score > best_conf:
                     best_conf = score
                     best_idx = i
+            if det_info and frame_index % 30 == 0:
+                print("[K230] dets({}): {}".format(len(det_info), " ".join(det_info)))
             if best_idx >= 0:
                 x, y, w, h = results[0][best_idx]
                 ball_cx = float(x) + float(w) / 2.0
                 ball_cy = float(y) + float(h) / 2.0
                 ball_conf = best_conf
+                box_w = int(w)
+                box_h = int(h)
                 ball_valid = True
     perf_yolo_ms += _ticks_diff(time.ticks_ms(), yolo_start)
 
@@ -470,10 +509,8 @@ while True:
         x_cm = pixel_to_cm(filtered_x)
         x_cm_x100 = int(round(x_cm * 100.0))
         quality = int(_clamp(ball_conf * 100.0, 10, 90))
-        marker_w = int(w) if ball_valid else 12
-        marker_h = int(h) if ball_valid else 12
-        stream_marker = (int(ball_cx - marker_w / 2), int(ball_cy - marker_h / 2),
-                         marker_w, marker_h, int(filtered_x), int(ball_cy))
+        stream_marker = (int(ball_cx - box_w / 2), int(ball_cy - box_h / 2),
+                         box_w, box_h, int(filtered_x), int(ball_cy))
         send_ball(True, x_cm_x100, 0, quality, tracker.ready)
     else:
         tracker.miss()
@@ -489,13 +526,12 @@ while True:
             last_pc_attempt_ms = now_ms
             pc_sock = pc_connect_once()
 
-    # 5. JPEG encoding & streaming
+    # 5. JPEG encoding & streaming (from CHN_0 RGB565)
     if (pc_sock is not None and not video_sender.pending() and
             _ticks_diff(now_ms, last_video_enqueue_ms) >= VIDEO_INTERVAL_MS):
         try:
             jpeg_start = time.ticks_ms()
-            # Convert AI's RGB888 frame to RGB565 for JPEG compression
-            stream_img = ai_img.to_rgb565()
+            stream_img = sensor.snapshot()  # CHN_0, RGB565
             jpeg = encode_video_jpeg(stream_img, stream_marker)
             video_sender.enqueue_payload(STREAM_CODEC_JPEG, jpeg)
             perf_jpeg_ms += _ticks_diff(time.ticks_ms(), jpeg_start)
@@ -537,7 +573,7 @@ while True:
             print("[K230] Loop:{:.1f} {} UART:{} Video:{:.1f}fps {:.1f}KB/s "
                   "ms/frame cap:{:.1f} yolo:{:.1f} enc:{:.1f} net:{:.1f}".format(
                 clock.fps(), state, uart_seq, video_fps, video_kb_s,
-                perf_capture_ms / 30.0, perf_yolo_ms / 30.0,
+                perf_cap_ms / 30.0, perf_yolo_ms / 30.0,
                 perf_jpeg_ms / 30.0, perf_send_ms / 30.0
             ))
         else:
@@ -546,7 +582,7 @@ while True:
         video_stat_start_ms = now_ms
         video_count = 0
         video_bytes = 0
-        perf_capture_ms = 0
+        perf_cap_ms = 0
         perf_yolo_ms = 0
         perf_jpeg_ms = 0
         perf_send_ms = 0

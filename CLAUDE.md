@@ -88,23 +88,52 @@
 
 ## 四、对我们方案的影响
 
-### 当前方案检查
+### 当前方案（2026-07-30 更新）
 
 ```
-K230 摄像头 → WiFi 图传 → PC 录屏         ✅ 合规（无线图传）
-K230 摄像头 → 颜色阈值找钢球 → UART → MSPM0 ✅ 合规（多 MCU 分工）
-MSPM0 → 红外循迹 + 舵机控制                  ✅ 合规（红外循迹）
-PC 端仅接收显示 + 录屏                       ✅ 合规（不回车）
+GC2093 → K230 YOLO11n NPU 钢球检测 → UART → MSPM0 舵机控制
+       → K230 CHN_0 RGB565 → JPEG → K23V/TCP WiFi → PC 接收端  ✅ 合规（无线图传）
+       → K230 CHN_2 RGBP888 → AI2D → YOLO NPU 推理
+PC 端仅接收显示 + 录屏（按 r 键）                                    ✅ 合规（不回车）
 ```
+
+#### YOLO NPU 管道（k230_code/k230_yolo.py）
+| 组件 | 细节 |
+|------|------|
+| 模型 | yolo11n_det_320.kmodel（Laoguigui2 钢球专用，1类，3MB） |
+| 输入 | CHN_2 RGBP888 640×480 → AI2D letterbox pad + bilinear resize → 320×320 |
+| 初始化顺序 | **set_framesize → set_pixformat**（顺序错误触发 Yahboom v1.4.3 buf_init bug） |
+| 置信度阈值 | 0.35（0.5 以上漏检严重） |
+| 推理速度 | ~30ms/帧（NPU 独立于 CPU） |
+| 总帧率 | ~22 FPS（含 JPEG 编码 + WiFi 推流） |
+| 图传 FPS | ~5-6 FPS（JPEG Q=50 @ 640×240 pipe crop） |
+
+#### K23V 视频协议（关键！）
+- Header: `K23V` (4B) + version (1B) + codec (1B=JPEG) + **4-byte BE length**
+- 之前有 bug：发送 3byte 长度 + 1byte 未初始化 0 → PC 解析出 256x 大小的帧 → 永远不解码
+- PC 接收端：`pc_receiver/pc_receiver.py`，依赖 `opencv-python numpy`
+
+#### 关键文件
+| 文件 | 用途 |
+|------|------|
+| `k230_code/k230_yolo.py` | 主程序：YOLO 检测 + WiFi 推流 + UART |
+| `k230_code/k230_final.py` | 备用：motion-based 检测器（无 NPU） |
+| `pc_receiver/pc_receiver.py` | PC 端接收 + 显示 + 录像 |
+| `k230_code/libs/` | K230 SDK 库文件（YOLO, AI2D, AIBase, etc.） |
+| `reference_code/laoguigui2/` | Laoguigui2 参考代码 + kmodel |
+| `tools/transfer_to_k230.py` | 串口文件传输脚本 |
 
 ### 风险点
-1. **同频 WiFi 干扰**：赛场多队同时用 2.4G，考虑 5.8G 图传模块作备选，或选冷门信道
-2. **全程误差 ≤1cm**：对 PID 控制精度要求极高，需要仔细调参
+1. **同频 WiFi 干扰**：赛场多队同时用 2.4G，考虑 5.8G 图传模块作备选
+2. **全程误差 ≤1cm**：YOLO 检测精度依赖 pixel-to-cm 标定（PX_PER_CM 需实测）
 3. **钢球脱落 = 失败**：防滚落挡片要做好
-4. **不允许场外处理回传**：PC 端只做录像，不做任何处理回传给车
+4. **不允许场外处理回传**：PC 端只做录像
+5. **YOLO 模型是 1 类检测器**：只检测钢球，换其他模型需确认 class count 匹配
 
 ### 编码注意事项
-- K230 UART 协议里 err_x/err_y 的缩放因子 (`PX_PER_CM`) 必须以实际物理尺寸标定
-- 舵机 PID 控制频率建议 ≥50Hz
-- 图传 JPEG 质量在清晰度和帧率之间平衡（当前 Q=25 @ 640x480 ≈ 17 FPS）
-- 测试前关闭 K230 上除 WiFi 外的所有无线功能（蓝牙等）
+- K230 传感器初始化：**必须先 set_framesize 再 set_pixformat**，否则 CHN_2 触发 buf_init
+- YOLO labels 用 dict 格式：`{0: 'steel'}`，不是 list（class_num = len(labels)）
+- K23V 协议长度字段用 **4 字节 BE**（与 PC 端 `struct.unpack(">I")` 对齐）
+- 模型加载时 sensor 不要 run（避免 CHN_2 4 帧缓冲溢出）
+- 图传 JPEG Q=50 @ 640×240 crop 约 8KB/帧，5fps ≈ 40KB/s
+- 测试前关闭 K230 上除 WiFi 外的所有无线功能

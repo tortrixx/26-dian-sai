@@ -62,23 +62,17 @@ class PipeLine:
                 self.sensor.set_vflip(vflip)
 
 
-            DISPLAY_MAP = {
-                "hdmi":     Display.LT9611,
-                "lt9611":   Display.LT9611,
-                "lcd":      Display.ST7701,
-                "st7701":   Display.ST7701,
-                "hx8399":   Display.HX8399,
-                "nt35516":  Display.NT35516,
-                "nt35532":  Display.NT35532,
-                "gc9503":   Display.GC9503,
-                "aml020t":  Display.AML020T,
-                "jd9852":   Display.JD9852,
-                "ili9806":  Display.ILI9806,
-                "virt":     Display.VIRT,
+            # Lazy display lookup — avoids crashing on firmware missing some drivers.
+            _DISPLAY_ATTRS = {
+                "hdmi": "LT9611", "lt9611": "LT9611",
+                "lcd": "ST7701", "st7701": "ST7701",
+                "hx8399": "HX8399", "nt35516": "NT35516",
+                "nt35532": "NT35532", "gc9503": "GC9503",
+                "aml020t": "AML020T", "jd9852": "JD9852",
+                "ili9806": "ILI9806", "virt": "VIRT",
             }
-
-            # Look up type, fallback to ST7701 if not found
-            display_type = DISPLAY_MAP.get(self.display_mode, Display.ST7701)
+            attr_name = _DISPLAY_ATTRS.get(self.display_mode, "ST7701")
+            display_type = getattr(Display, attr_name, Display.ST7701)
 
             # Call init
             if self.display_size:
