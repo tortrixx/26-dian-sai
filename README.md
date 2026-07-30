@@ -7,6 +7,7 @@
 | K230 视觉、UART、图传 | `k230_code/k230_final.py` | 唯一部署入口 |
 | PC 图传接收与录像 | `pc_receiver/pc_receiver.py` | 与当前 TCP 协议匹配 |
 | Ti/MSPM0 控制逻辑参考 | `ti_reference/firmware_state_machine_skeleton.c` | 待合入实际 Ti 工程 |
+| MPU-6050 独立点亮测试 | `ti_mpu6050_test/` | 已在 LP-MSPM0G3507 实机通过；不驱动执行器 |
 | 协议参考 | `k230_libs/k230_mspm0_uart_protocol.py` | 已完成 |
 
 ## 当前基线
@@ -24,5 +25,6 @@
 - `k230_libs/`：UART 协议参考实现。
 - `pc_receiver/`：PC 图传接收、显示与录像。
 - `ti_reference/`：Ti/MSPM0 控制参考骨架，非可直接烧录工程。
+- `ti_mpu6050_test/`：LP-MSPM0G3507 的 MPU-6050 独立 I²C 测试，可复现构建；正式控制接入说明见 `文档/MPU6050独立测试与接入指引.md`。
 - `文档/`：当前交接、TODO、装配、标定、图传和验收资料。
 - `reference_code/`：队友提供的历史参考代码；不得替代比赛入口。

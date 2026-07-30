@@ -9,3 +9,15 @@ record_*.avi
 
 # VS Code local workspace state
 .vscode/*.log
+
+# Generated MSPM0 MPU-6050 bring-up artifacts.  The canonical inputs are the
+# C source, SysConfig file, target configuration and build script.
+ti_mpu6050_test/*.obj
+ti_mpu6050_test/*.out
+ti_mpu6050_test/*.map
+ti_mpu6050_test/ti_msp_dl_config.c
+ti_mpu6050_test/ti_msp_dl_config.h
+ti_mpu6050_test/device.opt
+ti_mpu6050_test/device.cmd.genlibs
+ti_mpu6050_test/device_linker.cmd
+ti_mpu6050_test/*.log

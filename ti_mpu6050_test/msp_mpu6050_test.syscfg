@@ -1,0 +1,35 @@
+/**
+ * Minimal MPU-6050 bring-up for LP-MSPM0G3507.
+ * PB2/PB3 are the LaunchPad I2C1 pins wired to SCL/SDA; UART0 uses the
+ * XDS110 application UART so results appear on COM5 at 115200 baud.
+ */
+//@cliArgs --device "MSPM0G350X" --package "LQFP-64(PM)" --part "Default"
+//@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"
+// @cliArgs --board /ti/boards/LP_MSPM0G3507 --rtos nortos
+
+const I2C = scripting.addModule("/ti/driverlib/I2C", {}, false);
+const I2C1 = I2C.addInstance();
+const UART = scripting.addModule("/ti/driverlib/UART", {}, false);
+const UART0 = UART.addInstance();
+const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL", {}, false);
+const Board = scripting.addModule("/ti/driverlib/Board", {}, false);
+
+I2C1.$name = "I2C";
+I2C1.basicEnableController = true;
+I2C1.basicControllerBusSpeed = 100000;
+I2C1.advAnalogGlitchFilter = "DISABLED";
+I2C1.peripheral.$assign = "I2C1";
+I2C1.peripheral.sclPin.$assign = "PB2";
+I2C1.peripheral.sdaPin.$assign = "PB3";
+
+UART0.$name = "UART_0";
+UART0.targetBaudRate = 115200;
+UART0.enableFIFO = true;
+UART0.enableDMARX = false;
+UART0.enableDMATX = false;
+UART0.peripheral.$assign = "UART0";
+UART0.peripheral.rxPin.$assign = "PA11";
+UART0.peripheral.txPin.$assign = "PA10";
+
+SYSCTL.forceDefaultClkConfig = true;
+SYSCTL.clockTreeEn = true;
