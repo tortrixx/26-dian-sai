@@ -54,6 +54,25 @@ except Exception:
     pass
 
 
+DETECTION_MODE = "motion"  # "blobs" | "circles" | "motion" (帧差法——球是唯一移动的)
+
+# Image preprocessing — amplify subtle contrast between steel ball and pipe.
+# CLAHE (adaptive histogram equalization) stretches local brightness differences.
+# Enable when the ball is barely visible against the pipe surface in top-down view.
+PREPROCESS_ENABLE = False     # CLAHE enhances pipe texture too — disable for now
+PREPROCESS_HISTEQ = True      # Adaptive histogram equalization (CLAHE)
+PREPROCESS_CLIP_LIMIT = 2     # CLAHE contrast clip (1-4, lower = less noise amp)
+PREPROCESS_GAMMA = 1.0        # Gamma >1 brightens midtones (1.0 = off)
+PREPROCESS_CONTRAST = 1.0     # Contrast multiplier >1 increases ball vs pipe gap
+
+# Circle detection parameters (used only when DETECTION_MODE == "circles").
+# find_circles() detects circular edges regardless of brightness — ideal for
+# a steel ball that blends into the pipe surface in top-down view.
+CIRCLE_R_MIN = 3     # 最小半径 px，排除噪点
+CIRCLE_R_MAX = 10    # 最大半径 px。1cm球俯视通常 5-8px 半径
+CIRCLE_THRESHOLD = 1200  # 窄条ROI下降低阈值，捕捉更弱的球边缘
+CIRCLE_ROI_MARGIN = 10   # circle ROI 在 pipe ROI 基础上各边外扩 px
+
 # ---- 1. Wire protocol.  Keep this self-contained for /sdcard deployment. ----
 PROTO_HEAD_0 = 0xAA
 PROTO_HEAD_1 = 0x55
@@ -123,8 +142,9 @@ VISION_PROFILES = {
     # min_pixels, max_pixels, nominal_pixels, track_half_width, max_speed
     # Latest real-ball five-point table (2026-07-29): visual zero=160.47 px.
     # Re-validate after any camera/focus change.
-    "fast_qvga": (640, 480, 320, 240, 160.47, 11.80, (10, 68, 300, 110),
-                   40, 140, 78, 50, 350.0),
+    "fast_qvga": (640, 480, 320, 240, 160.47, 11.80, (0, 97, 320, 40),
+                   15, 120, 78, 50, 350.0),
+# ↑ 窄条俯视：MIN=15 MAX=120，球面积约50-100px；管面纹理<15px被排除
     "vga_precision": (640, 480, 640, 480, 320, 15.0, (20, 135, 600, 220),
                       25, 600, 150, 100, 700.0),
 }
@@ -147,15 +167,15 @@ POSITION_QUAD_C = -14.8800357496
 # Real-ball samples occupy y=105..112 in the internal 320x240 vision image.
 # The wide ±35 px gate still covers the expected pipe displacement at ±8 deg,
 # while rejecting the upper/lower pipe edges seen during initial diagnostics.
-PIPE_CENTER_Y = 107
-MAX_BALL_Y_OFFSET_PX = 35
+PIPE_CENTER_Y = 117   # 窄条ROI中心 (0,97,320,40) → 97+20=117
+MAX_BALL_Y_OFFSET_PX = 22   # 窄条半高20 + 余量2
 
 # Ball appearance calibration.  The raw steel ball can appear either bright or
 # dark, hence two adaptive L-channel thresholds are searched every frame.
 MAX_ASPECT_RATIO = 1.70
 MIN_ROUNDNESS = 0.35  # Used only when this CanMV Blob API exposes roundness().
-L_CONTRAST_MARGIN = 12
-MIN_QUALITY = 50
+L_CONTRAST_MARGIN = 12   # 窄条ROI下恢复标准值，管面均匀时对比度足够
+MIN_QUALITY = 35   # 窄条诊断：允许较弱对比度的球通过，恢复后设50
 # Bright and dark masks must be scanned separately.  Combining them makes the
 # dark pipe seam and bright pipe surface one large foreground region, hiding a
 # steel ball that is otherwise visible to the camera.
@@ -181,8 +201,8 @@ CALIBRATION_STABLE_SPREAD_PX = 2.5
 # First-real-ball diagnostic. Enable it with OVERLAY_ENABLE to draw yellow
 # boxes around raw candidates and print why a candidate is rejected. Turn it
 # back off after the detector accepts the real ball; terminal I/O costs FPS.
-CALIBRATION_DIAGNOSTIC = False
-CALIBRATION_DIAGNOSTIC_EVERY = 30
+CALIBRATION_DIAGNOSTIC = False  # motion模式不需要blob诊断
+CALIBRATION_DIAGNOSTIC_EVERY = 10  # 更频繁打印
 calibration_count = 0
 calibration_sum_cx = 0.0
 calibration_sum_cy = 0.0
@@ -194,7 +214,7 @@ calibration_sum_quality = 0.0
 calibration_diagnostic_frames = 0
 
 # Alpha-beta tracking and reacquisition.
-TRACK_MISS_LIMIT = 3
+TRACK_MISS_LIMIT = 12   # motion模式检测稀疏，提高容错避免频繁丢锁
 ALPHA = 0.65
 BETA = 0.12
 
@@ -228,7 +248,7 @@ VIDEO_BACKEND = "jpeg_cpu"
 # control image at QVGA but encodes a 640-pixel-wide crop directly from the
 # original sensor frame, so physical pipe ticks are not blurred by the vision
 # downscale.  H.264 uses target FPS only when a compatible firmware exists.
-STREAM_PROFILE = "pipe_detail"
+STREAM_PROFILE = "control"  # 车架诊断：先用全图定位管子，定位后再切回pipe_detail
 STREAM_PROFILES = {
     # profile: (stream_width, stream_height, target_fps, JPEG_quality)
     "control":     (320, 240, 8, 70),
@@ -291,7 +311,7 @@ STREAM_OVERLAY_CROSS_SIZE = 12
 # Detector/IDE diagnostic overlays (ROI, calibrated zero and text) are still
 # optional because they are not part of the live evidence annotation and cost
 # work on every control-loop frame.
-OVERLAY_ENABLE = False
+OVERLAY_ENABLE = True   # 车架俯视诊断：显示ROI框+零线，定位管子
 OVERLAY_TEXT_SIZE = 20
 
 # Set False only for a 30 s Wi-Fi/JPEG benchmark before the steel ball arrives.
@@ -476,6 +496,195 @@ def _choose_best_tagged_candidate(tagged_candidates, predicted_x,
     return best, best_quality, best_polarity
 
 
+def _find_best_circle(img, roi, predicted_x, using_track_roi):
+    """Detect the steel ball as the best circular feature in the ROI.
+
+    find_circles() uses a Hough transform on edge pixels.  It detects the ball
+    by its round outline irrespective of whether it appears bright or dark
+    against the pipe surface — exactly what we need for top-down mounting.
+    """
+    # Helper to extract circle properties from either tuple or object.
+    def _circle_xyrm(c):
+        try:
+            return c.cx(), c.cy(), c.r(), c.magnitude()
+        except Exception:
+            pass
+        try:
+            return c.x(), c.y(), c.r(), c.magnitude()
+        except Exception:
+            pass
+        # Bare tuple (canmv): (x, y, r, magnitude)
+        if hasattr(c, '__getitem__') and hasattr(c, '__len__') and len(c) >= 4:
+            return int(c[0]), int(c[1]), int(c[2]), int(c[3])
+        return 0, 0, 0, 0
+
+    x, y, w, h = roi
+    search_x = max(0, x - CIRCLE_ROI_MARGIN)
+    search_y = max(0, y - CIRCLE_ROI_MARGIN)
+    search_w = min(img.width() - search_x, w + CIRCLE_ROI_MARGIN * 2)
+    search_h = min(img.height() - search_y, h + CIRCLE_ROI_MARGIN * 2)
+    circle_roi = (search_x, search_y, search_w, search_h)
+
+    try:
+        circles = img.find_circles(
+            roi=circle_roi,
+            threshold=CIRCLE_THRESHOLD,
+            x_margin=3, y_margin=3, r_margin=2,
+            r_min=CIRCLE_R_MIN, r_max=CIRCLE_R_MAX
+        )
+    except Exception as error:
+        print("[K230] find_circles failed:", error)
+        return None, 0
+
+    if circles is None or len(circles) == 0:
+        return None, 0
+
+    # Collect valid circles with their scores.
+    valid_circles = []
+    for circle in circles:
+        cx_val, cy_val, r_val, mag_val = _circle_xyrm(circle)
+        if r_val <= 0 or r_val < CIRCLE_R_MIN or r_val > CIRCLE_R_MAX:
+            continue
+        if abs(cy_val - PIPE_CENTER_Y) > MAX_BALL_Y_OFFSET_PX:
+            continue
+
+        proximity_bonus = 0.0
+        if using_track_roi:
+            dist = abs(cx_val - predicted_x)
+            proximity_bonus = max(0.0, 10.0 * (1.0 - dist / float(TRACK_HALF_WIDTH_PX)))
+
+        score = float(mag_val) + proximity_bonus * 500.0
+        valid_circles.append((cx_val, cy_val, r_val, mag_val, score))
+
+        if CALIBRATION_DIAGNOSTIC:
+            try:
+                img.draw_circle(cx_val, cy_val, r_val, color=(255, 255, 0), thickness=1)
+                img.draw_cross(cx_val, cy_val, color=(0, 255, 255), size=5, thickness=1)
+            except Exception:
+                pass
+
+    if len(valid_circles) == 0:
+        return None, 0
+
+    # Sort by score descending.
+    valid_circles.sort(key=lambda c: c[4], reverse=True)
+    best = valid_circles[0]
+    cx_val, cy_val, r_val, mag_val, _ = best
+
+    # Quality from relative strength: how dominant is the best circle?
+    if len(valid_circles) >= 2:
+        second_mag = valid_circles[1][3]
+        if second_mag > 0:
+            ratio = float(mag_val) / max(1.0, float(second_mag))
+            # One strong circle → 80-90.  Two equal circles → 10-20.
+            quality = int(_clamp((ratio - 1.0) / 3.0 * 90.0 + 20.0, 10, 90))
+        else:
+            quality = 75
+    else:
+        quality = 75  # Only one circle in strip — very likely the ball
+
+    return (cx_val, cy_val, r_val, mag_val), quality
+
+
+# Motion detection via column-profile background subtraction.
+# The ball is the only moving object in the pipe strip.  We model the pipe
+# surface as a per-column brightness profile and flag deviations.
+MOTION_COL_STEP = 8        # 每8列采样一次 (40个采样点，够用且快)
+MOTION_BG_LEARN_RATE = 0.015 # 背景每秒更新~50%，球停下2秒后融入背景
+MOTION_MIN_DEVIATION = 1.8   # 最低亮度偏差
+
+
+_motion_bg_profile = None     # List of mean-L per column group
+_motion_bg_ready = False
+_motion_bg_frame_count = 0
+
+
+def _motion_reset_background():
+    global _motion_bg_profile, _motion_bg_ready, _motion_bg_frame_count
+    _motion_bg_profile = None
+    _motion_bg_ready = False
+    _motion_bg_frame_count = 0
+
+
+def _find_ball_motion(img, roi):
+    """Detect the ball by column-profile deviation from a running background.
+
+    The pipe surface is modelled as one mean-L value per small column group.
+    A rolling steel ball locally darkens or brightens those columns, creating
+    a spike in the deviation profile.  This works even when the ball has zero
+    contrast against the pipe in a single static frame.
+    """
+    global _motion_bg_profile, _motion_bg_ready, _motion_bg_frame_count
+
+    x, y, w, h = roi
+    num_cols = w // MOTION_COL_STEP
+    if num_cols < 5:
+        return None, 0
+
+    # 1. Sample current column profile.
+    cur_profile = []
+    for i in range(num_cols):
+        col_x = x + i * MOTION_COL_STEP
+        try:
+            stats = img.get_statistics(roi=(col_x, y, MOTION_COL_STEP, h))
+            cur_profile.append(stats.l_mean())
+        except Exception:
+            cur_profile.append(50.0)
+
+    # 2. Initialise or update the background model.
+    if _motion_bg_profile is None or len(_motion_bg_profile) != num_cols:
+        _motion_bg_profile = list(cur_profile)
+        _motion_bg_frame_count = 1
+        _motion_bg_ready = False
+        return None, 0
+
+    _motion_bg_frame_count += 1
+    if _motion_bg_frame_count < 8:
+        # Average the first few frames to build a clean background.
+        for i in range(num_cols):
+            _motion_bg_profile[i] = (_motion_bg_profile[i] * (_motion_bg_frame_count - 1) +
+                                     cur_profile[i]) / _motion_bg_frame_count
+        return None, 0
+
+    _motion_bg_ready = True
+
+    # 3. Compute deviation profile.
+    deviations = []
+    for i in range(num_cols):
+        dev = abs(cur_profile[i] - _motion_bg_profile[i])
+        deviations.append(dev)
+
+    # 4. Smooth deviations with a small window.
+    smoothed = list(deviations)
+    for i in range(1, num_cols - 1):
+        smoothed[i] = (deviations[i - 1] + deviations[i] * 2 + deviations[i + 1]) / 4.0
+
+    # 5. Find the peak deviation.
+    peak_val = 0.0
+    peak_idx = 0
+    for i in range(num_cols):
+        if smoothed[i] > peak_val:
+            peak_val = smoothed[i]
+            peak_idx = i
+
+    if peak_val < MOTION_MIN_DEVIATION:
+        # 6. Slowly update background — even without a detection.
+        for i in range(num_cols):
+            _motion_bg_profile[i] += MOTION_BG_LEARN_RATE * (cur_profile[i] - _motion_bg_profile[i])
+        return None, 0
+
+    # 7. Ball found. Convert column index to pixel x.
+    ball_cx = x + peak_idx * MOTION_COL_STEP + MOTION_COL_STEP // 2
+    # Quality scales with peak deviation: 3 L → q=30, 10 L → q=90
+    quality = int(_clamp(peak_val * 9.0, 10, 90))
+
+    # 8. Slowly update background at all columns — stationary ball fades in ~2s.
+    for i in range(num_cols):
+        _motion_bg_profile[i] += MOTION_BG_LEARN_RATE * (cur_profile[i] - _motion_bg_profile[i])
+
+    return ball_cx, quality
+
+
 def _find_best_blob(img, roi, predicted_x, using_track_roi,
                     preferred_polarity=None):
     bright_threshold, dark_threshold = _adaptive_thresholds(img, roi)
@@ -566,6 +775,66 @@ def _find_best_blob(img, roi, predicted_x, using_track_roi,
     if best_quality < MIN_QUALITY:
         return None, 0, None
     return best, best_quality, best_polarity
+
+
+def _calibration_sample_circle(cx, cy, r_val, quality):
+    """Circle-mode calibration: print periodic radius and position statistics."""
+    global calibration_count, calibration_sum_cx, calibration_sum_cy
+    global calibration_sum_cx2, calibration_sum_pixels, calibration_sum_w
+    global calibration_sum_h, calibration_sum_quality
+
+    if not CALIBRATION_ENABLE:
+        return
+
+    cx_f = float(cx)
+    if calibration_count:
+        running_cx = calibration_sum_cx / float(calibration_count)
+        if abs(cx_f - running_cx) > CALIBRATION_STABLE_SPREAD_PX:
+            print("[CAL] {} motion/reset; waiting for a stable ball".format(
+                CALIBRATION_LABEL))
+            calibration_count = 0
+            calibration_sum_cx = 0.0
+            calibration_sum_cy = 0.0
+            calibration_sum_cx2 = 0.0
+            calibration_sum_pixels = 0.0
+            calibration_sum_w = 0.0
+            calibration_sum_h = 0.0
+            calibration_sum_quality = 0.0
+
+    calibration_count += 1
+    calibration_sum_cx += cx_f
+    calibration_sum_cy += float(cy)
+    calibration_sum_cx2 += cx_f * cx_f
+    # Store radius in 'pixels' and 'wh' slots for compatibility with the
+    # existing five-point summary line format.
+    r_px = float(r_val)
+    calibration_sum_pixels += 3.1416 * r_px * r_px  # approximate area
+    calibration_sum_w += r_px * 2.0
+    calibration_sum_h += r_px * 2.0
+    calibration_sum_quality += float(quality)
+
+    if calibration_count < CALIBRATION_REPORT_FRAMES:
+        return
+
+    count = float(calibration_count)
+    mean_cx = calibration_sum_cx / count
+    cx_var = max(0.0, calibration_sum_cx2 / count - mean_cx * mean_cx)
+    print("[CAL] {} n={} cx={:.2f} cy={:.2f} r={:.2f} area={:.1f} "
+          "q={:.1f} sx={:.3f}px (circle mode)".format(
+              CALIBRATION_LABEL, calibration_count, mean_cx,
+              calibration_sum_cy / count,
+              (calibration_sum_w / count) / 2.0,
+              calibration_sum_pixels / count,
+              calibration_sum_quality / count, cx_var ** 0.5))
+
+    calibration_count = 0
+    calibration_sum_cx = 0.0
+    calibration_sum_cy = 0.0
+    calibration_sum_cx2 = 0.0
+    calibration_sum_pixels = 0.0
+    calibration_sum_w = 0.0
+    calibration_sum_h = 0.0
+    calibration_sum_quality = 0.0
 
 
 def _calibration_sample(blob, quality):
@@ -686,6 +955,55 @@ def detect_ball(img, tracker, now_ms):
     else:
         search_roi = PIPE_ROI
 
+    polarity = None
+
+    if DETECTION_MODE == "motion":
+        ball_cx, quality = _find_ball_motion(img, search_roi)
+        if ball_cx is None:
+            tracker.miss()
+            _draw_overlay_text(img, 2, 2, "NO BALL ({})".format(tracker.misses),
+                               color=(255, 0, 0))
+            return False, 0, 0, 0, tracked, None
+        # Ball Y is assumed at pipe centre — motion detection gives only X.
+        ball_cy = PIPE_CENTER_Y
+        if OVERLAY_ENABLE:
+            img.draw_circle(ball_cx, ball_cy, 6, color=(255, 0, 0), thickness=2)
+            img.draw_cross(ball_cx, ball_cy, color=(0, 255, 0), size=10, thickness=2)
+            _draw_overlay_text(img, 2, 2, "x={:.2f}cm q={} (motion)".format(
+                _pixel_to_cm(ball_cx), quality), color=(255, 255, 255))
+        filtered_x_px = tracker.update(ball_cx, now_ms)
+        x_cm = _pixel_to_cm(filtered_x_px)
+        x_cm_x100 = int(round(x_cm * 100.0))
+        y_offset_px = 0
+        marker = (ball_cx - 6, ball_cy - 6, 12, 12, filtered_x_px, ball_cy)
+        return True, x_cm_x100, y_offset_px, quality, tracked, marker
+
+    if DETECTION_MODE == "circles":
+        best, quality = _find_best_circle(
+            img, search_roi, predicted_x, tracked
+        )
+        if best is None:
+            tracker.miss()
+            _draw_overlay_text(img, 2, 2, "NO BALL ({})".format(tracker.misses),
+                               color=(255, 0, 0))
+            return False, 0, 0, 0, tracked, None
+        circle_cx, circle_cy, circle_r_val, _ = best
+        if OVERLAY_ENABLE:
+            img.draw_circle(circle_cx, circle_cy, circle_r_val,
+                            color=(255, 0, 0), thickness=2)
+            img.draw_cross(circle_cx, circle_cy, color=(0, 255, 0), size=10, thickness=2)
+            _draw_overlay_text(img, 2, 2, "x={:.2f}cm q={}".format(
+                _pixel_to_cm(circle_cx), quality), color=(255, 255, 255))
+        _calibration_sample_circle(circle_cx, circle_cy, circle_r_val, quality)
+        filtered_x_px = tracker.update(circle_cx, now_ms)
+        x_cm = _pixel_to_cm(filtered_x_px)
+        x_cm_x100 = int(round(x_cm * 100.0))
+        y_offset_px = circle_cy - PIPE_CENTER_Y
+        marker = (circle_cx - circle_r_val, circle_cy - circle_r_val,
+                  circle_r_val * 2, circle_r_val * 2, filtered_x_px, circle_cy)
+        return True, x_cm_x100, y_offset_px, quality, tracked, marker
+
+    # Blob detection (original side-view path).
     best, quality, polarity = _find_best_blob(
         img, search_roi, predicted_x, tracked,
         tracker.polarity if tracked else None
@@ -1178,6 +1496,24 @@ def encode_video_jpeg(capture_img, vision_img, canvas, marker=None):
     return bytes(vision_img.compress(quality=JPEG_Q))
 
 
+def preprocess_vision_image(img):
+    """Enhance subtle contrast between the steel ball and pipe surface.
+
+    CLAHE stretches local brightness differences tile-by-tile.  A 1 cm ball
+    that differs from the pipe by only 2-3 L units gets stretched to 20-30
+    units, making it visible to the blob detector.  Gamma + contrast further
+    amplify the gap.
+    """
+    if not PREPROCESS_ENABLE:
+        return
+    try:
+        if PREPROCESS_HISTEQ:
+            img.histeq(adaptive=True, clip_limit=PREPROCESS_CLIP_LIMIT)
+        img.gamma(gamma=PREPROCESS_GAMMA, contrast=PREPROCESS_CONTRAST)
+    except Exception as error:
+        print("[K230] Preprocessing failed:", error)
+
+
 def make_vision_canvas(sensor_width, sensor_height):
     """Create the QVGA detector frame while retaining the full sensor FOV."""
     if sensor_width == VISION_W and sensor_height == VISION_H:
@@ -1240,8 +1576,10 @@ perf_jpeg_ms = 0
 perf_send_ms = 0
 
 if VISION_ENABLE:
-    print("[K230] Running: vision -> UART; {} video is best-effort only".format(
-        active_video_backend
+    preprocess_tag = "+CLAHE+g{:.1f}+c{:.1f}".format(
+        PREPROCESS_GAMMA, PREPROCESS_CONTRAST) if PREPROCESS_ENABLE else ""
+    print("[K230] Running: vision({}{}) -> UART; {} video is best-effort only".format(
+        DETECTION_MODE, preprocess_tag, active_video_backend
     ))
 else:
     print("[K230] Running: STREAM BENCHMARK ONLY ({}); UART sends invalid observations".format(
@@ -1263,6 +1601,9 @@ while True:
     else:
         img = frame
     perf_capture_ms += _ticks_diff(time.ticks_ms(), capture_start_ms)
+
+    # 1.5 Enhance image contrast before detection if preprocessing is enabled.
+    preprocess_vision_image(img)
 
     # 2. Vision can be disabled temporarily to measure the true stream ceiling.
     vision_start_ms = time.ticks_ms()
