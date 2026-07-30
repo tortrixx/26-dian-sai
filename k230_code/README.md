@@ -54,10 +54,10 @@ GC2093 摄像头
 ```
 k230_code/
 ├── k230_yolo.py          # 主力：YOLO NPU 检测 + WiFi 推流
+├── k230_calibrate.py     # 标定工具：含 WiFi 推流 + ROI 过滤
 ├── k230_final.py         # 备用：motion-based 检测器
 ├── libs/                  # K230 SDK 库（YOLO, AI2D, AIBase, Utils, PipeLine）
 ├── diagnostics/           # 诊断脚本（sensor 测试、YOLO 调试）
-├── legacy_diagnostics/    # 历史实验代码归档
 └── README.md
 ```
 
