@@ -278,8 +278,19 @@ STREAM_VERSION = 1
 STREAM_CODEC_JPEG = 1
 STREAM_CODEC_H264 = 2
 
-# Debug overlays are not required for the competition video and cost CPU time.
-# Keep them off for normal streaming; the serial log still reports detection.
+# The PC evidence stream must visibly show the accepted steel-ball position.
+# This is separate from the IDE diagnostic overlay below: it is drawn only on
+# frames selected for JPEG transmission, so it does not add work to every
+# control-loop frame or affect UART tracking.
+STREAM_OVERLAY_ENABLE = True
+STREAM_OVERLAY_BOX_COLOR = (255, 0, 0)
+STREAM_OVERLAY_CROSS_COLOR = (0, 255, 0)
+STREAM_OVERLAY_THICKNESS = 2
+STREAM_OVERLAY_CROSS_SIZE = 12
+
+# Detector/IDE diagnostic overlays (ROI, calibrated zero and text) are still
+# optional because they are not part of the live evidence annotation and cost
+# work on every control-loop frame.
 OVERLAY_ENABLE = False
 OVERLAY_TEXT_SIZE = 20
 
@@ -658,7 +669,13 @@ class AlphaBetaTracker:
 
 
 def detect_ball(img, tracker, now_ms):
-    """Run one traditional-vision observation and return the UART fields."""
+    """Run one observation and return UART fields plus a visual marker.
+
+    The marker is in the internal vision-image coordinate system:
+    ``(box_x, box_y, box_w, box_h, cross_x, cross_y)``.  It is deliberately
+    returned separately from the UART payload so display annotations can never
+    modify, delay or feed back into the control path.
+    """
     predicted_x = tracker.predicted_x(now_ms)
     tracked = tracker.use_local_roi()
     if tracked:
@@ -677,7 +694,7 @@ def detect_ball(img, tracker, now_ms):
         tracker.miss()
         _draw_overlay_text(img, 2, 2, "NO BALL ({})".format(tracker.misses),
                            color=(255, 0, 0))
-        return False, 0, 0, 0, tracked
+        return False, 0, 0, 0, tracked, None
 
     _calibration_sample(best, quality)
     filtered_x_px = tracker.update(best.cx(), now_ms, polarity)
@@ -690,7 +707,12 @@ def detect_ball(img, tracker, now_ms):
         img.draw_cross(best.cx(), best.cy(), color=(0, 255, 0), size=10, thickness=2)
         _draw_overlay_text(img, 2, 2, "x={:.2f}cm q={}".format(x_cm, quality),
                            color=(255, 255, 255))
-    return True, x_cm_x100, y_offset_px, quality, tracked
+    box_x, box_y, box_w, box_h = best.rect()
+    # Use the filtered tracker location for the crosshair so the displayed
+    # center follows the same position delivered to the MSPM0.  The box stays
+    # on the current blob, making a bad association immediately visible.
+    marker = (box_x, box_y, box_w, box_h, filtered_x_px, best.cy())
+    return True, x_cm_x100, y_offset_px, quality, tracked, marker
 
 
 # ---- UART ----
@@ -1044,8 +1066,79 @@ def make_video_canvas():
         return None
 
 
-def encode_video_jpeg(capture_img, vision_img, canvas):
-    """Encode display video while keeping the 320x240 vision path independent."""
+def _clamp_overlay_rect(x, y, width, height, frame_w, frame_h):
+    """Clip a rectangle to the encoded video frame, or return None if absent."""
+    left = max(0, min(frame_w, int(round(x))))
+    top = max(0, min(frame_h, int(round(y))))
+    right = max(0, min(frame_w, int(round(x + width))))
+    bottom = max(0, min(frame_h, int(round(y + height))))
+    if right <= left or bottom <= top:
+        return None
+    return (left, top, right - left, bottom - top)
+
+
+def _vision_marker_to_video(marker, source_mode, frame_w, frame_h):
+    """Map a detector marker onto the current encoded video coordinates."""
+    if marker is None:
+        return None
+
+    box_x, box_y, box_w, box_h, cross_x, cross_y = marker
+    if source_mode == "capture_pipe":
+        crop_x, crop_y, crop_w, crop_h = PIPE_VIDEO_CROP
+        # The detector works on a full-FOV, scaled vision image.  Recover the
+        # matching source-frame pixels before shifting into the pipe crop.
+        box_x = box_x / VISION_INPUT_SCALE_X - crop_x
+        box_y = box_y / VISION_INPUT_SCALE_Y - crop_y
+        box_w = box_w / VISION_INPUT_SCALE_X
+        box_h = box_h / VISION_INPUT_SCALE_Y
+        cross_x = cross_x / VISION_INPUT_SCALE_X - crop_x
+        cross_y = cross_y / VISION_INPUT_SCALE_Y - crop_y
+        scale_x = frame_w / float(crop_w)
+        scale_y = frame_h / float(crop_h)
+    else:
+        scale_x = frame_w / float(VISION_W)
+        scale_y = frame_h / float(VISION_H)
+
+    rect = _clamp_overlay_rect(
+        box_x * scale_x, box_y * scale_y,
+        box_w * scale_x, box_h * scale_y, frame_w, frame_h
+    )
+    cross_x = int(round(cross_x * scale_x))
+    cross_y = int(round(cross_y * scale_y))
+    if cross_x < 0 or cross_x >= frame_w or cross_y < 0 or cross_y >= frame_h:
+        return rect, None, None
+    return rect, cross_x, cross_y
+
+
+def _draw_stream_marker(video_img, marker, source_mode=VIDEO_SOURCE_MODE,
+                        frame_w=VIDEO_W, frame_h=VIDEO_H):
+    """Draw the accepted detection box and tracker crosshair on a video frame."""
+    if not STREAM_OVERLAY_ENABLE:
+        return
+    mapped = _vision_marker_to_video(marker, source_mode, frame_w, frame_h)
+    if mapped is None:
+        return
+    rect, cross_x, cross_y = mapped
+    try:
+        if rect is not None:
+            video_img.draw_rectangle(
+                rect, color=STREAM_OVERLAY_BOX_COLOR,
+                thickness=STREAM_OVERLAY_THICKNESS
+            )
+        if cross_x is not None:
+            video_img.draw_cross(
+                cross_x, cross_y, color=STREAM_OVERLAY_CROSS_COLOR,
+                size=STREAM_OVERLAY_CROSS_SIZE,
+                thickness=STREAM_OVERLAY_THICKNESS
+            )
+    except Exception as error:
+        # Annotation is evidence-only: a firmware drawing issue must never
+        # interrupt JPEG delivery, ball detection or UART control.
+        print("[K230] stream overlay failed:", error)
+
+
+def encode_video_jpeg(capture_img, vision_img, canvas, marker=None):
+    """Encode video and place the ball box/crosshair on the transmitted frame."""
     if VIDEO_SOURCE_MODE == "capture_pipe":
         crop_x, crop_y, crop_w, crop_h = PIPE_VIDEO_CROP
         if canvas is not None:
@@ -1053,6 +1146,7 @@ def encode_video_jpeg(capture_img, vision_img, canvas):
                 # Drawing the full source at a negative offset clips exactly
                 # to the canvas, avoiding a per-frame crop-image allocation.
                 canvas.draw_image(capture_img, -crop_x, -crop_y)
+                _draw_stream_marker(canvas, marker)
                 return bytes(canvas.compress(quality=JPEG_Q))
             except Exception as error:
                 print("[K230] Pipe ROI canvas failed; trying copy(roi):", error)
@@ -1061,10 +1155,13 @@ def encode_video_jpeg(capture_img, vision_img, canvas):
         # not clip draw_image() with negative coordinates.
         try:
             pipe_img = capture_img.copy(roi=(crop_x, crop_y, crop_w, crop_h))
+            _draw_stream_marker(pipe_img, marker)
             return bytes(pipe_img.compress(quality=JPEG_Q))
         except Exception as error:
             print("[K230] Pipe ROI copy failed; using vision JPEG:", error)
         # Last-resort stream continuity; UART/vision must remain independent.
+        _draw_stream_marker(vision_img, marker, source_mode="vision",
+                            frame_w=VISION_W, frame_h=VISION_H)
         return bytes(vision_img.compress(quality=JPEG_Q))
 
     if canvas is not None:
@@ -1072,9 +1169,12 @@ def encode_video_jpeg(capture_img, vision_img, canvas):
             canvas.draw_image(vision_img, 0, 0,
                               x_scale=VIDEO_SCALE_X,
                               y_scale=VIDEO_SCALE_Y)
+            _draw_stream_marker(canvas, marker)
             return bytes(canvas.compress(quality=JPEG_Q))
         except Exception as error:
             print("[K230] Vision-video scale failed; using vision JPEG:", error)
+    _draw_stream_marker(vision_img, marker, source_mode="vision",
+                        frame_w=VISION_W, frame_h=VISION_H)
     return bytes(vision_img.compress(quality=JPEG_Q))
 
 
@@ -1167,7 +1267,7 @@ while True:
     # 2. Vision can be disabled temporarily to measure the true stream ceiling.
     vision_start_ms = time.ticks_ms()
     if VISION_ENABLE:
-        valid, x_cm_x100, y_offset_px, quality, tracked = detect_ball(
+        valid, x_cm_x100, y_offset_px, quality, tracked, stream_marker = detect_ball(
             img, tracker, now_ms
         )
     else:
@@ -1176,6 +1276,7 @@ while True:
         quality = 0
         valid = False
         tracked = False
+        stream_marker = None
     perf_vision_ms += _ticks_diff(time.ticks_ms(), vision_start_ms)
 
     if OVERLAY_ENABLE:
@@ -1219,7 +1320,7 @@ while True:
           _ticks_diff(now_ms, last_video_enqueue_ms) >= VIDEO_INTERVAL_MS):
         try:
             jpeg_start_ms = time.ticks_ms()
-            jpeg = encode_video_jpeg(frame, img, video_canvas)
+            jpeg = encode_video_jpeg(frame, img, video_canvas, stream_marker)
             video_sender.enqueue_payload(STREAM_CODEC_JPEG, jpeg)
             perf_jpeg_ms += _ticks_diff(time.ticks_ms(), jpeg_start_ms)
             last_video_enqueue_ms = now_ms
