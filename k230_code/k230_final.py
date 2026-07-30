@@ -589,10 +589,10 @@ def _find_best_circle(img, roi, predicted_x, using_track_roi):
 # Motion detection via column-profile background subtraction.
 # The ball is the only moving object in the pipe strip.  We model the pipe
 # surface as a per-column brightness profile and flag deviations.
-MOTION_COL_STEP = 10       # 每10列采样一次 (32个采样点)
+MOTION_COL_STEP = 8        # 每8列采样 (40点)，FPS充裕可加强信号
 MOTION_BG_LEARN_RATE = 0.015 # 背景每秒更新~50%，球停下2秒后融入背景
-MOTION_MIN_DEVIATION = 1.8   # 最低亮度偏差
-MOTION_SKIP_FRAMES = 1       # 跟踪稳定时每N+1帧检测一次 (1=每2帧)
+MOTION_MIN_DEVIATION = 1.5   # 降低阈值捕捉慢速微动 (原1.8)
+MOTION_SKIP_FRAMES = 0       # 暂不跳帧——先收集稳定数据做五点标定
 
 
 _motion_bg_profile = None     # List of mean-L per column group
