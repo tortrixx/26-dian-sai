@@ -248,7 +248,7 @@ VIDEO_BACKEND = "jpeg_cpu"
 # control image at QVGA but encodes a 640-pixel-wide crop directly from the
 # original sensor frame, so physical pipe ticks are not blurred by the vision
 # downscale.  H.264 uses target FPS only when a compatible firmware exists.
-STREAM_PROFILE = "control"  # 车架诊断：先用全图定位管子，定位后再切回pipe_detail
+STREAM_PROFILE = "pipe_detail"  # 640x240管子带 — 画质优先
 STREAM_PROFILES = {
     # profile: (stream_width, stream_height, target_fps, JPEG_quality)
     "control":     (320, 240, 8, 70),
@@ -259,7 +259,7 @@ STREAM_PROFILES = {
     "quality":     (480, 360, 10, 75),
     # 640x240 original-frame crop, Q80 @8fps: recommended single-camera
     # evidence stream while 320x240 vision/UART remains the control priority.
-    "pipe_detail": (640, 240, 8, 80),
+    "pipe_detail": (640, 240, 6, 50),
 }
 VIDEO_W, VIDEO_H, VIDEO_TARGET_FPS, JPEG_Q = STREAM_PROFILES[STREAM_PROFILE]
 VIDEO_INTERVAL_MS = max(1, 1000 // VIDEO_TARGET_FPS)
@@ -311,7 +311,7 @@ STREAM_OVERLAY_CROSS_SIZE = 12
 # Detector/IDE diagnostic overlays (ROI, calibrated zero and text) are still
 # optional because they are not part of the live evidence annotation and cost
 # work on every control-loop frame.
-OVERLAY_ENABLE = True   # 车架俯视诊断：显示ROI框+零线，定位管子
+OVERLAY_ENABLE = False  # 关闭诊断叠加层省性能
 OVERLAY_TEXT_SIZE = 20
 
 # Set False only for a 30 s Wi-Fi/JPEG benchmark before the steel ball arrives.
@@ -589,21 +589,26 @@ def _find_best_circle(img, roi, predicted_x, using_track_roi):
 # Motion detection via column-profile background subtraction.
 # The ball is the only moving object in the pipe strip.  We model the pipe
 # surface as a per-column brightness profile and flag deviations.
-MOTION_COL_STEP = 8        # 每8列采样一次 (40个采样点，够用且快)
+MOTION_COL_STEP = 10       # 每10列采样一次 (32个采样点)
 MOTION_BG_LEARN_RATE = 0.015 # 背景每秒更新~50%，球停下2秒后融入背景
 MOTION_MIN_DEVIATION = 1.8   # 最低亮度偏差
+MOTION_SKIP_FRAMES = 1       # 跟踪稳定时每N+1帧检测一次 (1=每2帧)
 
 
 _motion_bg_profile = None     # List of mean-L per column group
 _motion_bg_ready = False
 _motion_bg_frame_count = 0
+_motion_skip_counter = 0      # Frame-skip counter for stable tracking
+_motion_col_x_cache = None    # Pre-computed column x positions
 
 
 def _motion_reset_background():
-    global _motion_bg_profile, _motion_bg_ready, _motion_bg_frame_count
+    global _motion_bg_profile, _motion_bg_ready, _motion_bg_frame_count, _motion_skip_counter, _motion_col_x_cache
     _motion_bg_profile = None
     _motion_bg_ready = False
     _motion_bg_frame_count = 0
+    _motion_skip_counter = 0
+    _motion_col_x_cache = None
 
 
 def _find_ball_motion(img, roi):
@@ -615,18 +620,24 @@ def _find_ball_motion(img, roi):
     contrast against the pipe in a single static frame.
     """
     global _motion_bg_profile, _motion_bg_ready, _motion_bg_frame_count
+    global _motion_col_x_cache
 
     x, y, w, h = roi
     num_cols = w // MOTION_COL_STEP
     if num_cols < 5:
         return None, 0
 
+    # Pre-compute column x positions once.
+    if _motion_col_x_cache is None or len(_motion_col_x_cache) != num_cols:
+        _motion_col_x_cache = [x + i * MOTION_COL_STEP for i in range(num_cols)]
+
     # 1. Sample current column profile.
     cur_profile = []
-    for i in range(num_cols):
-        col_x = x + i * MOTION_COL_STEP
+    col_h = h
+    col_w = MOTION_COL_STEP
+    for col_x in _motion_col_x_cache:
         try:
-            stats = img.get_statistics(roi=(col_x, y, MOTION_COL_STEP, h))
+            stats = img.get_statistics(roi=(col_x, y, col_w, col_h))
             cur_profile.append(stats.l_mean())
         except Exception:
             cur_profile.append(50.0)
@@ -648,39 +659,35 @@ def _find_ball_motion(img, roi):
 
     _motion_bg_ready = True
 
-    # 3. Compute deviation profile.
-    deviations = []
-    for i in range(num_cols):
-        dev = abs(cur_profile[i] - _motion_bg_profile[i])
-        deviations.append(dev)
-
-    # 4. Smooth deviations with a small window.
-    smoothed = list(deviations)
-    for i in range(1, num_cols - 1):
-        smoothed[i] = (deviations[i - 1] + deviations[i] * 2 + deviations[i + 1]) / 4.0
-
-    # 5. Find the peak deviation.
+    # 3. Compute deviation and find peak in one pass (avoids extra list alloc).
     peak_val = 0.0
     peak_idx = 0
-    for i in range(num_cols):
-        if smoothed[i] > peak_val:
-            peak_val = smoothed[i]
+    prev_dev = abs(cur_profile[0] - _motion_bg_profile[0])
+    for i in range(1, num_cols - 1):
+        cur_dev = abs(cur_profile[i] - _motion_bg_profile[i])
+        next_dev = abs(cur_profile[i + 1] - _motion_bg_profile[i + 1])
+        smoothed = (prev_dev + cur_dev * 2 + next_dev) / 4.0
+        if smoothed > peak_val:
+            peak_val = smoothed
             peak_idx = i
+        prev_dev = cur_dev
 
     if peak_val < MOTION_MIN_DEVIATION:
-        # 6. Slowly update background — even without a detection.
+        # 4. Slowly update background — even without a detection.
+        bg_lr = MOTION_BG_LEARN_RATE
         for i in range(num_cols):
-            _motion_bg_profile[i] += MOTION_BG_LEARN_RATE * (cur_profile[i] - _motion_bg_profile[i])
+            _motion_bg_profile[i] += bg_lr * (cur_profile[i] - _motion_bg_profile[i])
         return None, 0
 
-    # 7. Ball found. Convert column index to pixel x.
-    ball_cx = x + peak_idx * MOTION_COL_STEP + MOTION_COL_STEP // 2
+    # 5. Ball found. Convert column index to pixel x.
+    ball_cx = _motion_col_x_cache[peak_idx] + MOTION_COL_STEP // 2
     # Quality scales with peak deviation: 3 L → q=30, 10 L → q=90
     quality = int(_clamp(peak_val * 9.0, 10, 90))
 
-    # 8. Slowly update background at all columns — stationary ball fades in ~2s.
+    # 6. Slowly update background at all columns — stationary ball fades in ~2s.
+    bg_lr = MOTION_BG_LEARN_RATE
     for i in range(num_cols):
-        _motion_bg_profile[i] += MOTION_BG_LEARN_RATE * (cur_profile[i] - _motion_bg_profile[i])
+        _motion_bg_profile[i] += bg_lr * (cur_profile[i] - _motion_bg_profile[i])
 
     return ball_cx, quality
 
@@ -933,6 +940,15 @@ class AlphaBetaTracker:
     def miss(self):
         self.misses += 1
 
+    def predict_only(self, now_ms):
+        """Advance state without a measurement for frame-skipping."""
+        if not self.ready:
+            return float(ZERO_X_PX)
+        dt_s = _clamp(_ticks_diff(now_ms, self.last_ms) / 1000.0, 0.001, 0.25)
+        self.x = self.x + self.v * dt_s
+        self.last_ms = now_ms
+        return self.x
+
     def use_local_roi(self):
         return self.ready and self.misses < TRACK_MISS_LIMIT
 
@@ -958,20 +974,43 @@ def detect_ball(img, tracker, now_ms):
     polarity = None
 
     if DETECTION_MODE == "motion":
-        ball_cx, quality = _find_ball_motion(img, search_roi)
-        if ball_cx is None:
+        global _motion_skip_counter
+
+        # Frame-skip during stable tracking: run detection every N+1 frames.
+        do_detect = True
+        if tracked and tracker.misses == 0:
+            _motion_skip_counter += 1
+            if _motion_skip_counter <= MOTION_SKIP_FRAMES:
+                do_detect = False
+        else:
+            _motion_skip_counter = 0
+
+        if do_detect:
+            ball_cx, quality = _find_ball_motion(img, search_roi)
+
+        if do_detect and ball_cx is not None:
+            # Detection succeeded — update tracker with measurement.
+            ball_cy = PIPE_CENTER_Y
+            filtered_x_px = tracker.update(ball_cx, now_ms)
+        elif not do_detect:
+            # Skip frame — predict from velocity, keep tracking alive.
+            filtered_x_px = tracker.predict_only(now_ms)
+            # Use last known quality; clip to moderate confidence.
+            quality = 50
+            ball_cx = int(filtered_x_px)
+            ball_cy = PIPE_CENTER_Y
+        else:
             tracker.miss()
             _draw_overlay_text(img, 2, 2, "NO BALL ({})".format(tracker.misses),
                                color=(255, 0, 0))
             return False, 0, 0, 0, tracked, None
-        # Ball Y is assumed at pipe centre — motion detection gives only X.
-        ball_cy = PIPE_CENTER_Y
+
         if OVERLAY_ENABLE:
             img.draw_circle(ball_cx, ball_cy, 6, color=(255, 0, 0), thickness=2)
             img.draw_cross(ball_cx, ball_cy, color=(0, 255, 0), size=10, thickness=2)
-            _draw_overlay_text(img, 2, 2, "x={:.2f}cm q={} (motion)".format(
-                _pixel_to_cm(ball_cx), quality), color=(255, 255, 255))
-        filtered_x_px = tracker.update(ball_cx, now_ms)
+            tag = "motion" if do_detect else "pred"
+            _draw_overlay_text(img, 2, 2, "x={:.2f}cm q={} ({})".format(
+                _pixel_to_cm(filtered_x_px), quality, tag), color=(255, 255, 255))
         x_cm = _pixel_to_cm(filtered_x_px)
         x_cm_x100 = int(round(x_cm * 100.0))
         y_offset_px = 0
@@ -1688,6 +1727,11 @@ while True:
                 h264.request_clean_decoder_start()
 
     frame_index += 1
+    if frame_index % 60 == 0:
+        try:
+            gc.collect()
+        except Exception:
+            pass
     if frame_index % 30 == 0:
         state = "x={:.2f}cm q={}".format(x_cm_x100 / 100.0, quality) if valid else "NO BALL"
         stat_elapsed_ms = max(1, _ticks_diff(now_ms, video_stat_start_ms))
