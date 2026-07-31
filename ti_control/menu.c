@@ -81,7 +81,7 @@ static void Menu_StopSelectedFunction(void)
     if (gSelectedIndex == MENU_ITEM_LINE_FOLLOW) {
         LineFollow_Stop();
     } else if (gSelectedIndex == MENU_ITEM_STATIC_BALL) {
-        StaticBall_Exit();
+        StaticBall_Stop();
     }
 }
 

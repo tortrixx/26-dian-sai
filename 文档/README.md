@@ -5,18 +5,20 @@
 
 ## 1. 当前最终结论（2026-07-31 更新）
 
-2026-07-31 完成视觉标定、图传稳定性修复和 MSPM0 控制固件编写。MSPM0 固件尚未编译和联调。
+2026-07-31 完成视觉标定、图传稳定性修复、MSPM0 控制固件编写和编译、BallTracker 状态机优化。
 
 | 项目 | 最终值 | 状态 |
 | --- | --- | --- |
 | 视觉方案 | YOLO11n NPU（Laoguigui2 模型，1 类，320×320 输入） | ✅ |
+| 跟踪器 | BallTracker 状态机 (SEARCH→CONFIRM→TRACK→HOLD→LOST) | ✅ |
 | pixel→cm 标定 | ZERO_X_PX=345.0, PX_PER_CM=20.1 | ✅ 五点实机 |
-| K230 循环帧率 | ~26 FPS（含 NPU + JPEG + WiFi） | ✅ 日志实测 |
+| K230 循环帧率 | ~27 FPS（含 NPU + JPEG + WiFi） | ✅ 日志实测 |
 | NPU 推理 | ~30 ms/帧 | ✅ |
+| Pipe ROI 门控 | (0, 120, 640, 240) 滤除管外误检 | ✅ |
 | 图传 | K23V/TCP，JPEG Q50，640×240 pipe crop，~5 FPS | ✅ 断线问题已修复 |
 | PC 接收 | `pc_receiver/pc_receiver.py`，K23V，按 r 录像 | ✅ |
 | MPU-6050 | I²C PB2/PB3，WHO_AM_I=0x68，互补滤波模块已编写 | ⚠️ 未接入当前方案 |
-| MSPM0 固件 | `ti_control/msp_control.c`，纯视觉 PD，100Hz | 📝 已编写，待编译 |
+| MSPM0 固件 | `ti_control/` (15 模块)，级联 PID + 自检 | ✅ 已编译验证 |
 | 硬件装配 | 摆管、MG996、相机、供电 | ✅ |
 
 ### 方案架构
@@ -29,8 +31,8 @@ GC2093 摄像头
                                                                       pixel_to_cm()
                                                                              ↓
                                                                        UART → MSPM0
-K230 UART IO9(TX) → MSPM0 PA9(RX)  AA 55 协议，x_cm_x100
-MSPM0 PA6(TIMG0) → MG996 信号线  50Hz PWM
+K230 UART IO9(TX) → MSPM0 PB16(RX)  AA 55 协议，x_cm_x100
+MSPM0 PA8(GPIO) → MG996 信号线  50Hz 软件 PWM
 PC 端仅接收显示 + 录屏                                             ✅ 合规（不回车）
 ```
 
@@ -92,9 +94,14 @@ Wi‑Fi 仅用于赛外实时显示与录像；闭环唯一数据链是 K230→M
 
 - 五点 pixel→cm 标定（ZERO_X_PX=345.0, PX_PER_CM=20.1）
 - 图传断连问题修复（非阻塞 socket 容错）
-- 编写 MSPM0 完整控制固件（ti_control/）——纯视觉 PD，无需 IMU
+- 编写 + 编译 MSPM0 完整控制固件（ti_control/）——级联 PID + 自检，无需 IMU
 - 编写 MPU-6050 互补滤波 + 姿态估计模块（备用）
 - K230 cx 像素坐标加入状态日志，编写标定工具 k230_calibrate.py
+- BallTracker 状态机替换 Alpha-Beta tracker（SEARCH→CONFIRM→TRACK→HOLD→LOST）
+- Pipe ROI 门控过滤 YOLO 管外误检
+- MSPM0 级联 PID 控制器 + 自检扫角功能
+- 内存优化：预分配 UART 帧缓冲 + JPEG 编码缓冲，禁用 draw_result
+- 代码清理：移除冗余常量与死代码
 
 ## 5. 下一个 agent 的接手顺序
 

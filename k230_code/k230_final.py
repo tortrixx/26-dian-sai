@@ -220,7 +220,6 @@ MISS_HOLD_DETECTIONS = 3     # misses before declaring LOST (was 25, now state-d
 MAX_TRACK_JUMP_PX = 60       # px — reject wild false positives (~5cm equivalent)
 FILTER_ALPHA = 0.35          # exponential smoothing for position
 PIPE_CENTER_TOLERANCE = 22   # px — reject detections far from pipe centerline
-TRACK_MISS_LIMIT = 25        # kept for compatibility with use_local_roi()
 
 # UART: K230 TX -> MSPM0 RX, K230 RX <- MSPM0 TX (optional), and common ground.
 UART_BAUD = 115200

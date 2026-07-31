@@ -7,11 +7,11 @@
 | K230 YOLO 视觉、UART、图传 | `k230_code/k230_yolo.py` | ✅ 主力入口，标定已完成 |
 | K230 标定工具 | `k230_code/k230_calibrate.py` | ✅ 含 WiFi 推流 + ROI 过滤 |
 | PC 图传接收与录像 | `pc_receiver/pc_receiver.py` | ✅ K23V 协议，按 r 录像 |
-| MSPM0 控制固件 | `ti_control/msp_control.c` | 📝 已编写，**待编译联调** |
-| MSPM0 SysConfig | `ti_control/msp_control.syscfg` | 📝 待 SysConfig CLI 生成 |
+| MSPM0 控制固件 | `ti_control/` (15 模块) | ✅ 已编译，待实机联调 |
+| MSPM0 SysConfig | `ti_control/msp_control.syscfg` | ✅ I2C1 only |
 | Ti 控制逻辑参考 | `ti_reference/firmware_state_machine_skeleton.c` | 参考（非实际工程） |
 | MPU-6050 点亮 + 姿态估计 | `ti_mpu6050_test/` | ✅ I²C 通过，姿态模块待接入 |
-| K230↔MSPM0 协议参考 | `k230_libs/k230_mspm0_uart_protocol.py` | ✅ |
+| K230↔MSPM0 协议参考 | `k230_libs/k230_mspm0_uart_protocol.py` | ✅ (AA 55 协议) |
 | 串口文件传输 | `tools/transfer_to_k230.py` | ✅ |
 
 ## 当前基线（2026-07-31）
@@ -36,7 +36,7 @@ PX_PER_CM = 20.1     # 每厘米约 20 个像素
 - 总循环 ~26 FPS（含 NPU + JPEG + WiFi）
 - 置信度阈值 0.35
 - 图传：CHN_0 RGB565 → JPEG Q50 640×240 pipe crop → K23V/TCP → ~5-6 FPS
-- α-β tracker 内置
+- α-β tracker 内置 → BallTracker 状态机
 
 ### 图传稳定性修复（2026-07-31）
 
@@ -46,16 +46,17 @@ K230 非阻塞 socket 在 TCP 缓冲区满时会返回 0 或抛 OSError(EAGAIN)�
 - 连续 60 次失败（~3 秒）才判定为真正断线
 - 重连冷却 2s→3s
 
-### MSPM0 控制固件（已编写，待编译）
+### MSPM0 控制固件（已编译，待联调）
 
-`ti_control/msp_control.c`：
+`ti_control/`（15 模块固件）：
 - 纯视觉方案，不需要 MPU-6050
-- UART1 RX (PA9) 接收 K230 AA 55 帧（状态机解析）
-- TIMG0 PWM (PA6) 50Hz MG996 舵机输出
-- TIMG4 100Hz 控制中断
-- PD 控制器：Kp=0.80, Ki=0, Kd=0.15（初始值，待实车调参）
-- 安全保护：视觉 200ms 超时→限速回中位、±8°摆角限制、边缘救球
-- 调试串口 (UART0) 命令：m0-m5 切模式、t+5.0 设目标、pk/dk/ik 在线调参
+- UART2 PB16 RX 接收 K230 AA 55 帧（流式解析 + ISR 环形缓冲）
+- PA8 软件 PWM 50Hz MG996 舵机输出
+- 级联 PID 控制器（外环位置 + 内环速度，MOVE/HOLD 双增益）
+- 速度估计：EMA 滤波帧间差分
+- 安全保护：500ms 视觉超时→coast、15 帧连续无效→脱开、±10° 倾角限制
+- 自检：启动时舵机扫 {60°, 120°, 90°} 验证硬件
+- 编译：`cd ti_control && .\build.ps1` → `msp_control.out`
 
 ### 硬件状态
 

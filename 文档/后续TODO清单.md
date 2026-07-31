@@ -1,6 +1,6 @@
 # 后续 TODO 清单
 
-> 最后更新：2026-07-31。MSPM0 固件已编写完毕，等待编译和联调。
+> 最后更新：2026-07-31。MSPM0 固件已编译通过，YOLO+BallTracker 优化完成，等待实机联调。
 
 ## 已完成 ✅
 
@@ -12,21 +12,26 @@
 - [x] 标定工具 k230_calibrate.py（含 WiFi 推流 + ROI 误检过滤）
 - [x] MPU-6050 独立 I²C 点亮（WHO_AM_I=0x68, PB2/PB3）
 - [x] MPU-6050 姿态估计模块（互补滤波 + 零偏标定，mpu6050.h/c）
-- [x] MSPM0 完整控制固件编写（ti_control/msp_control.c）
-- [x] 串口传输工具更新（tools/transfer_to_k230.py）
+- [x] MSPM0 完整控制固件编写 + 编译（ti_control/，15 模块，级联 PID）
+- [x] 串口传输工具更新（tools/transfer_to_k230.py + _transfer_one.py + _reset_k230.py）
+- [x] BallTracker 状态机（SEARCH→CONFIRM→TRACK→HOLD→LOST，替代 Alpha-Beta）
+- [x] Pipe ROI 门控过滤管外 YOLO 误检
+- [x] draw_result 禁用消除 REPL UART 阻塞
+- [x] 视频 JPEG 编码预分配缓冲区（消除 GC 压力）
+- [x] 代码清理：移除冗余 TRACK_MISS_LIMIT，修复 S3→StaticBall_Stop
 - [x] 硬件装配（摆管、MG996、相机支架已固定）
 - [x] 图传验收：连续推流 60s 无断连，K230 Loop ~26 FPS
 
 ## P0：MSPM0 固件编译与无球联调（下一步！）
 
-- [ ] **编译 MSPM0 控制固件**
-  - 运行 `ti_control/build.ps1`，产出 `msp_control.out`
-  - 用 CCS 或 DSLite 烧录到 LP-MSPM0G3507
+- [x] **编译 MSPM0 控制固件** ✅
+  - 运行 `ti_control/build.ps1`，产出 `msp_control.out` (~14 KB)
+  - 用 DSLite 烧录到 LP-MSPM0G3507
 
 - [ ] **接线**
-  - K230 IO9 (TX) → MSPM0 PA9 (UART1 RX)
-  - K230 IO10 (RX) ← MSPM0 PA8 (UART1 TX, 可选)
-  - MSPM0 PA6 (TIMG0 C0) → MG996 信号线
+  - K230 IO9 (TX) → MSPM0 PB16 (UART2 RX)
+  - K230 IO10 (RX) ← MSPM0 PA21 (UART2 TX, 可选)
+  - MSPM0 PA8 (GPIO 软件 PWM) → MG996 信号线
   - MG996 独立大电流电源（>2A），GND 与 MSPM0 GND 共地
   - K230 GND — MSPM0 GND — MG996 电源 GND 三者共地
 
@@ -81,4 +86,4 @@
 2. `ti_control/README.md`（MSPM0 固件接线和命令表格）
 3. K230 标定参数：`ZERO_X_PX=345.0, PX_PER_CM=20.1`
 4. 当前 K230 入口：`k230_code/k230_yolo.py`
-5. MSPM0 固件入口：`ti_control/msp_control.c`
+5. MSPM0 固件入口：`ti_control/empty.c` → `app.c`（15 模块级联 PID）

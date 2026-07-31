@@ -32,7 +32,7 @@ python tools\_transfer_one.py   # 或 python tools\transfer_to_k230.py COM6
 │    ├─ CHN_2 RGBP888 640×480 → AI2D → YOLO11n NPU         │
 │    │    ~30ms 推理 → 钢球坐标 (cx, cy, confidence)         │
 │    │    → pixel_to_cm() → xCmX100                         │
-│    │    → Alpha-Beta tracker → 滤波坐标                    │
+│    │    → BallTracker state machine → 滤波坐标              │
 │    │                                                      │
 │    ├─ UART1 IO9/IO10 @ 115200 → AA 55 协议帧              │
 │    │    → MSPM0 PB16 (UART2 RX)                           │
@@ -46,7 +46,7 @@ python tools\_transfer_one.py   # 或 python tools\transfer_to_k230.py COM6
 │  │  main() → App_Init() → App_Run() 主循环            │    │
 │  │                                                    │    │
 │  │  K230Uart_Task  → AA 55 帧解析 (ISR + 环形缓冲)    │    │
-│  │  StaticBall_Task → bang-bang 控制器 (10ms)         │    │
+│  │  StaticBall_Task → cascade PID 控制器 (10ms)       │    │
 │  │  Servo_Task      → PA8 软件 PWM 50Hz               │    │
 │  │  LineFollow_Task → 巡线状态机                       │    │
 │  │  Motor_Task      → 双电机 PI 速度控制               │    │
@@ -156,50 +156,70 @@ Byte 11:   checksum        bytes 2-10 求和 mod 256
 **注意**: `K230_ResetParser()` 同时重置 ring head/tail。仅在 `K230Uart_Init()` 中调用 (IRQ 尚未使能)，所以安全。
 
 ### `static_ball.c` / `static_ball.h` — 任务3：静态滚球控制
-**核心控制器模块。**
+**核心控制器模块。采用级联 PID 架构。**
 
 ```c
 控制参数:
     CONTROL_PERIOD_MS = 10         // 控制周期
-    VISION_TIMEOUT_MS = 200        // 视觉超时 → 脱开
+    VISION_TIMEOUT_MS = 500        // 视觉超时 → 允许 tracker coast
     MIN_QUALITY = 1                // 最低置信度
-    INVALID_LIMIT = 3              // 连续无效帧 → 脱开
-    DIRECTION_DEADBAND_CM_X100 = 20  // ±0.2cm 死区
+    INVALID_LIMIT = 15             // ~150ms 连续无效帧 → 脱开
 
 目标:
     POS_TARGET = +5.0 cm
     NEG_TARGET = -5.0 cm
-    ARRIVE_BAND = 0.5 cm            // 到达判定
+    ARRIVE_BAND = 0.5 cm           // 到达判定
 
 舵机:
-    SERVO_NEUTRAL_DEG = 90          // 中位 90°=1500µs
-    SERVO_DIRECTION = -1.0          // 翻转方向
-    SERVO_DEG_PER_TILT_DEG = 1.0    // 1:1 映射
-
-倾角 (可独立调节):
-    MOVE_TILT_LEFT_DEG  = 12        // 球偏左,移动阶段
-    MOVE_TILT_RIGHT_DEG = 12        // 球偏右,移动阶段
-    HOLD_TILT_LEFT_DEG  = 8         // 球偏左,保持阶段
-    HOLD_TILT_RIGHT_DEG = 8         // 球偏右,保持阶段
+    SERVO_NEUTRAL_DEG = 90         // 中位 90°=1500µs
+    SERVO_DIRECTION = -1.0         // 翻转方向
 ```
+
+**级联 PID 架构** (2026-07-31):
+```
+外环(位置): targetVel = KP_OUTER × posError          [cm/s]
+内环(速度): tiltDeg   = KP_INNER × velError          [deg]
+
+posError = targetCm - ballCm         (正值=球在目标左侧)
+velError = targetVel - measuredVel   (正值=需要更多右移速度)
+```
+
+MOVE/HOLD 双增益表:
+
+| 参数 | MOVE | HOLD |
+|------|------|------|
+| KP_OUTER | 2.0 (cm/s)/cm | 1.5 (cm/s)/cm |
+| KP_INNER | 0.5 deg/(cm/s) | 0.8 deg/(cm/s) |
+| MAX_SPEED | 15.0 cm/s | 8.0 cm/s |
+| MAX_TILT | 10.0° | 6.0° |
+
+HOLD 阶段额外包含积分项:
+- `KI_HOLD = 0.05 deg/(cm·s)` — 缓慢消除水管水平偏差
+- 积分限幅 `±3.0 cm·s` — 防止 windup
+- 死区 `±0.3 cm` — 死区内 tilt=0 但积分继续累积
 
 **相序状态机**:
 ```
-WAIT_VISION(0) → 收到首帧 → TO_POS(1) → 到达+4.5cm → TO_NEG(2) → 到达-4.5cm → HOLD_NEG(3)
+SELF_TEST(0) → WAIT_VISION(1) → TO_POS(2) → TO_NEG(3) → HOLD_NEG(4)
 ```
-- TO_POS: 目标 +5cm, 大倾角 (MOVE_TILT_*)
-- TO_NEG: 目标 -5cm, 大倾角
-- HOLD_NEG: 目标 -5cm, 小倾角 (HOLD_TILT_*), ±0.2cm 死区内倾角=0
+- 自检: 舵机扫 {60°, 120°, 90°}，每角度 800ms
+- TO_POS: 目标 +5cm, MOVE 高增益
+- TO_NEG: 目标 -5cm, MOVE 高增益
+- HOLD_NEG: 目标 -5cm, HOLD 低增益 + 积分补偿
+
+**速度估计**: EMA 滤波 (α=0.3)，帧间差分 → cm/s
 
 **安全**:
-- 200ms 无有效帧 → `StaticBall_DisableServo()` (PA8 拉低, 无 PWM)
-- 连续 3 帧无效 → 同上
+- 500ms 无有效帧 → 继续 coast（BallTracker 维持最后位置）
+- 连续 15 帧无效 → 舵机脱开
 - 舵机角度软件限制 0-180°
+- 最小倾角阈值 1.0° → 低于此值发 0°（消抖）
 
 **菜单集成**:
-- S2 启动: `StaticBall_Start()` (进入 WAIT_VISION)
+- S2 启动: `StaticBall_Start()` (进入自检 → WAIT_VISION)
 - S3 停止: `StaticBall_Stop()` (脱开 + 重置)
 - S4 返回: `StaticBall_Exit()` (同 Stop, 返回菜单)
+- OLED 显示: 球位置 X/V、目标 G、相位 P、自检角度 TST S
 
 ### `servo.c` / `servo.h` — 软件 PWM 舵机驱动
 **关键**: 不是硬件 PWM。用 `delay_cycles()` 产生 50Hz 信号。
@@ -313,7 +333,9 @@ while True:
     2. yolo.run(ai_np) → 检测结果
        - 最高置信度框 → 钢球中心坐标
        - 模型: yolo11n_det_320.kmodel, 1类, 置信度阈值 0.35
-    3. AlphaBetaTracker.update/filter → 滤波坐标
+       - Pipe ROI gating: 仅接受 (0,120,640,240) 内的检测
+    3. BallTracker.update/filter → 滤波坐标
+       - SEARCH → CONFIRM(2帧一致) → TRACK → HOLD(3miss) → LOST
     4. send_ball() → UART AA 55 帧 → MSPM0
     5. WiFi (非阻塞):
        - boot 时初始化一次 wifi_init_nonblock()
@@ -381,26 +403,29 @@ PX_PER_CM = 20.1           # 像素/cm 转换比
 ## 五、当前状态 (2026-07-31)
 
 ### 已验证
-- [x] 编译: `build.ps1` → `msp_control.out` (16,184 bytes)
+- [x] 编译: `build.ps1` → `msp_control.out` (~14 KB)
 - [x] 烧录: DSLite + XDS110 成功
 - [x] OLED 菜单: 5 项菜单 + 按键导航
 - [x] K230 → MSPM0 UART: AA 55 帧接收正常
-- [x] K230 球检测: YOLO11n NPU 检测 + 坐标显示正常
+- [x] K230 球检测: YOLO11n NPU + BallTracker + pipe ROI gating, ~27 FPS
 - [x] WiFi 非阻塞: 无 WiFi 时检测不卡顿
 - [x] 舵机 PWM: PA8 软件 PWM 编译通过
+- [x] 级联 PID 自检扫角: {60°, 120°, 90°} → 中性位
+- [x] K23V 图传容错修复: 非阻塞 socket, 连续 60 次失败才断线
 
 ### 待验证
 - [ ] 舵机实机运动 (MG996 需外接 5V/>2A)
 - [ ] 方向标定 (SERVO_DIRECTION = -1.0 是否正确)
-- [ ] 倾角幅度调参 (上升/下降不对称问题)
-- [ ] Static Ball 完整流程 (+5cm → -5cm → hold)
+- [ ] 级联 PID 增益调参 (MOVE/HOLD 四组 KP)
+- [ ] Static Ball 完整流程 (+5cm → -5cm → hold @ -5cm)
 - [ ] 巡线功能 (未测试)
 
 ### 已知问题
-1. **舵机不对称**: 用户报告上升幅度小、下降幅度大。已添加独立 LEFT/RIGHT 倾角值待调。
+1. **PID 增益未调**: MOVE/HOLD 的 KP_OUTER/KP_INNER 是理论值，需实车调参
 2. **K230 自启动**: 脚本设为开机自启 → 串口 REPL 被占用 → 需复位+抢占方式传文件
 3. **encoder ISR**: 两个编码器共享 GPIOB 中断, 任一变化都更新两者 (性能损失可接受)
 4. **无 IMU**: MPU-6050 驱动在 `ti_mpu6050_test/`, 当前未集成
+5. **AI2D letterbox**: 钢球在 320×320 输入中仅 ~7px，接近 YOLO11n 最小检测尺寸
 
 ---
 

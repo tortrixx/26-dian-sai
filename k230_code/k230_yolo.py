@@ -63,7 +63,6 @@ MISS_HOLD_DETECTIONS = 3      # misses before LOST
 MAX_TRACK_JUMP_PX = 80        # ~4cm — reject wild position jumps
 FILTER_ALPHA = 0.35           # position EMA smoothing
 TRACK_HALF_WIDTH_PX = 100     # local ROI half-width when tracking
-TRACK_MISS_LIMIT = 10         # kept for use_local_roi() compat
 
 # ---- UART ----
 UART_BAUD = 115200
@@ -571,7 +570,8 @@ while True:
         send_ball(True, x_cm_x100, 0, quality, tracker.ready)
     else:
         tracker.miss()
-        if tracker.ready and tracker.misses < TRACK_MISS_LIMIT:
+        if tracker.ready:
+            # Coast on last known position during brief HOLD (≤MISS_HOLD_DETECTIONS frames)
             pred_x = tracker.predicted_x(now_ms)
             pred_cm = pixel_to_cm(pred_x)
             send_ball(True, int(round(pred_cm * 100.0)), 0, 40, True)
