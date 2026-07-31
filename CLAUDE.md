@@ -114,17 +114,20 @@ PC 端仅接收显示 + 录屏（按 r 键）                                   
 - **图传稳定性修复（2026-07-31）**：非阻塞 socket 在 TCP 缓冲区满时返回 0/OSError(EAGAIN)，旧代码直接断线。修复：512B chunks + 连续 60 次失败才判定断线 + 重连冷却 3s
 - PC 接收端：`pc_receiver/pc_receiver.py`，依赖 `opencv-python numpy`
 
-#### MSPM0 控制固件（ti_control/，已编写待编译）
+#### MSPM0 控制固件（ti_control/，✅ 已编译验证）
 | 组件 | 细节 |
 |------|------|
-| 方案 | **纯视觉 PD，无 IMU**（MPU-6050 当前不可用） |
-| 入口 | `ti_control/msp_control.c` |
-| UART | PA9 (UART1 RX) ← K230 IO9 TX，AA 55 协议 |
-| PWM | PA6 (TIMG0 C0) → MG996 信号线，50Hz，1MHz 时钟 |
-| 控制周期 | 100Hz（TIMG4 中断），PD：Kp=0.80, Ki=0, Kd=0.15 |
-| 安全 | 200ms 视觉超时→限速回中、±8° 摆角限制、边缘救球 |
-| 调试 | UART0 (XDS110) 命令：m0-m5 切模式、t+5.0 设目标、pk/dk/ik 在线调参 |
-| 构建 | `cd ti_control && .\build.ps1` |
+| 方案 | **纯视觉 bang-bang，无 IMU**（MPU-6050 当前不可用） |
+| 入口 | `ti_control/empty.c` → `app.c`（15 个模块） |
+| UART | **UART2 PB16 RX** ← K230 IO9 TX，AA 55 协议，115200 8N1 |
+| 舵机 | **PA8 软件 PWM**，50Hz，0-180°（90°=1500µs 中位） |
+| 控制 | bang-bang 方向控制：球在目标左边→正倾角，右边→负倾角 |
+| 控制周期 | 10ms（`StaticBall_Task` 轮询），move=±12°, hold=±8° |
+| 安全 | 200ms 视觉超时→舵机脱开、3 帧连续无效→脱开 |
+| 构建 | `cd ti_control && .\build.ps1` → `msp_control.out` |
+| 烧录 | CCS 或 DSLite + `targetConfigs/MSPM0G3507.ccxml` |
+| 模块 | `app`, `buttons`, `encoder`, `k230_uart`, `line_follow`, `line_sensor`, `menu`, `motor`, `oled`, `servo`, `static_ball`, `system_time` |
+| SysConfig | **仅 I2C1 (PB2/PB3)**，其余外设全用 driverlib 直驱 |
 
 #### 关键文件
 | 文件 | 用途 |
@@ -133,9 +136,18 @@ PC 端仅接收显示 + 录屏（按 r 键）                                   
 | `k230_code/k230_calibrate.py` | 标定工具：含 WiFi 推流 + ROI 过滤 |
 | `k230_code/k230_final.py` | 备用：motion-based 检测器（无 NPU） |
 | `pc_receiver/pc_receiver.py` | PC 端接收 + 显示 + 录像（按 r 录，q 退） |
-| `ti_control/msp_control.c` | MSPM0 完整控制固件 |
-| `ti_control/msp_control.syscfg` | MSPM0 外设配置 |
-| `ti_control/README.md` | MSPM0 接线、校准、命令参考 |
+| `ti_control/empty.c` | MSPM0 入口 `main()` → App_Init/Run |
+| `ti_control/app.c` | 应用初始化 + 主循环调度 |
+| `ti_control/static_ball.c` | 任务3 静态滚球 bang-bang 控制器 |
+| `ti_control/servo.c` | PA8 软件 PWM 舵机驱动 |
+| `ti_control/k230_uart.c` | UART2 PB16 K230 视觉帧接收 + AA55 解析 |
+| `ti_control/motor.c` | TIMG0/TIMG7 硬件 PWM 双电机 PI 速度控制 |
+| `ti_control/line_follow.c` | 巡线状态机 + 差速转向 |
+| `ti_control/line_sensor.c` | 8 路红外巡线传感器 |
+| `ti_control/encoder.c` | GPIOB 正交编码器 |
+| `ti_control/menu.c` | OLED 菜单系统 |
+| `ti_control/msp_control.syscfg` | 仅 I2C1 (OLED)，其余外设用 driverlib 直驱 |
+| `ti_control/README.md` | MSPM0 接线、校准说明 |
 | `ti_mpu6050_test/mpu6050.h` | MPU-6050 姿态估计 API（互补滤波 + 零偏标定） |
 | `ti_mpu6050_test/mpu6050.c` | MPU-6050 姿态估计实现 |
 | `k230_code/libs/` | K230 SDK 库文件（YOLO, AI2D, AIBase, etc.） |
@@ -148,7 +160,7 @@ PC 端仅接收显示 + 录屏（按 r 键）                                   
 3. **钢球脱落 = 失败**：防滚落挡片要做好
 4. **不允许场外处理回传**：PC 端只做录像
 5. **YOLO 模型是 1 类检测器**：只检测钢球，换其他模型需确认 class count 匹配
-6. **MSPM0 固件未编译验证**：SysConfig 生成和编译可能需调整路径/版本
+6. **MSPM0 固件已验证编译**（~14 KB/128 KB flash），待实机烧录联调
 
 ### 编码注意事项
 - K230 传感器初始化：**必须先 set_framesize 再 set_pixformat**，否则 CHN_2 触发 buf_init
@@ -158,5 +170,7 @@ PC 端仅接收显示 + 录屏（按 r 键）                                   
 - 图传 JPEG Q=50 @ 640×240 crop 约 8KB/帧，5fps ≈ 40KB/s
 - 测试前关闭 K230 上除 WiFi 外的所有无线功能
 - K230 非阻塞 socket send() 可能返回 0 或 OSError——不要当作断线，重试即可
-- MSPM0 控制固件 UART 调试命令：`m2 t+5.0 go` 进入静态滚球模式
+- MSPM0 OLED 菜单 `Static Ball` → 自动 +5cm → -5cm → 保持；S3 停止，S4 返回
+- MSPM0 接线：K230 IO9→MSPM0 PB16 (UART2 RX)，舵机信号→PA8，I2C OLED→PB2/PB3
+- MSPM0 SysConfig 仅配置 I2C1；其余 UART/PWM/GPIO 用 `DL_xxx` API 直驱
 - MSPM0 编译环境：CCS `C:\ti\ccs2100`，SDK `2.10.00.04`，TI Arm Clang `4.0.2.LTS`，SysConfig `1.26.2`

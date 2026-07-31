@@ -1,68 +1,32 @@
 /**
- * MSPM0G3507 vision-only ball-balance firmware.
- *
- * Peripherals (NO I2C / MPU-6050):
- *   UART0 PA10=TX  PA11=RX   Debug (XDS110 backchannel, 115200)
- *   UART1 PA9=RX   PA8=TX    K230 vision data (K230 IO9→PA9, K230 IO10←PA8)
- *   TIMG0 PA6=C0   PWM       MG996 servo, 50Hz
- *   TIMG4                    Control-loop timer, 100Hz interrupt
- *
- * Power:
- *   MG996 V+ → independent high-current supply (>2A)
- *   MG996 GND — MSPM0 GND — K230 GND (common ground)
- *   MSPM0 3V3 ← LaunchPad USB or battery regulator
+ * These arguments were used when this file was generated. They will be automatically applied on subsequent loads
+ * via the GUI or CLI. Run CLI with '--help' for additional information on how to override these arguments.
  */
 //@cliArgs --device "MSPM0G350X" --package "LQFP-64(PM)" --part "Default"
 //@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"
 // @cliArgs --board /ti/boards/LP_MSPM0G3507 --rtos nortos
 
-const UART  = scripting.addModule("/ti/driverlib/UART",  {}, false);
-const UART0 = UART.addInstance();
-const UART1 = UART.addInstance();
-const TIMG  = scripting.addModule("/ti/driverlib/TIMG",  {}, false);
-const TIMG0 = TIMG.addInstance();
-const TIMG4 = TIMG.addInstance();
-const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL", {}, false);
-const Board  = scripting.addModule("/ti/driverlib/Board",  {}, false);
+/**
+ * Import the modules used in this configuration.
+ */
+const I2C    = scripting.addModule("/ti/driverlib/I2C", {}, false);
+const I2C1   = I2C.addInstance();
+const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL");
 
-/* ---- UART0: Debug (XDS110) ---- */
-UART0.$name               = "UART_0";
-UART0.targetBaudRate      = 115200;
-UART0.enableFIFO          = true;
-UART0.peripheral.$assign  = "UART0";
-UART0.peripheral.rxPin.$assign = "PA11";
-UART0.peripheral.txPin.$assign = "PA10";
+/**
+ * Write custom configuration values to the imported modules.
+ */
 
-/* ---- UART1: K230 vision RX ---- */
-UART1.$name               = "UART_1";
-UART1.targetBaudRate      = 115200;
-UART1.enableFIFO          = true;
-UART1.dataLength          = "8";
-UART1.parity              = "NONE";
-UART1.stopBits            = "1";
-UART1.peripheral.$assign  = "UART1";
-UART1.peripheral.rxPin.$assign = "PA9";    /* ← K230 IO9 (TX) */
-UART1.peripheral.txPin.$assign = "PA8";    /* → K230 IO10 (RX) */
+const Board = scripting.addModule("/ti/driverlib/Board", {}, false);
 
-/* ---- TIMG0: MG996 servo PWM, 50Hz ---- */
-TIMG0.$name                    = "SERVO_TIM";
-TIMG0.timerMode                = "EDGE_ALIGN_PWM";
-TIMG0.clockSource              = "BUSCLK";       /* 80 MHz */
-TIMG0.prescaler                = 80;             /* → 1 MHz */
-TIMG0.periodCounts             = 20000;          /* 50 Hz */
-TIMG0.channelA.enableCapture   = false;
-TIMG0.channelA.compareValue    = 1500;           /* 1.5ms = neutral */
-TIMG0.peripheral.$assign       = "TIMG0";
-TIMG0.peripheral.ccp0Pin.$assign = "PA6";
+I2C1.$name                         = "I2C_0";
+I2C1.basicEnableController         = true;
+I2C1.peripheral.$assign            = "I2C1";
+I2C1.peripheral.sdaPin.$assign     = "PB3";
+I2C1.peripheral.sclPin.$assign     = "PB2";
+I2C1.sdaPinConfig.enableConfig     = true;
+I2C1.sdaPinConfig.internalResistor = "PULL_UP";
+I2C1.sclPinConfig.enableConfig     = true;
+I2C1.sclPinConfig.internalResistor = "PULL_UP";
 
-/* ---- TIMG4: 100Hz control tick ---- */
-TIMG4.$name               = "CTRL_TIM";
-TIMG4.timerMode           = "DOWN";
-TIMG4.clockSource         = "BUSCLK";           /* 80 MHz */
-TIMG4.prescaler           = 800;                /* → 100 kHz */
-TIMG4.periodCounts        = 1000;               /* 100 Hz */
-TIMG4.zeroInterrupt       = true;
-
-/* ---- Clocks (default 80 MHz) ---- */
 SYSCTL.forceDefaultClkConfig = true;
-SYSCTL.clockTreeEn = true;

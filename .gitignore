@@ -29,4 +29,5 @@ ti_control/ti_msp_dl_config.h
 ti_control/device.opt
 ti_control/device.cmd.genlibs
 ti_control/device_linker.cmd
+ti_control/Event.dot
 ti_control/*.log

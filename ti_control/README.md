@@ -1,20 +1,19 @@
-# MSPM0 控制固件（纯视觉，无 IMU）
+# MSPM0 控制固件 —— 纯视觉 bang-bang，无 IMU
 
-架构：K230 YOLO → UART → MSPM0 PD → MG996 PWM
+架构：K230 YOLO11n NPU → UART2 PB16 (AA 55) → MSPM0 → 舵机 PA8 (软件 PWM)
 
-## 接线
+## 硬件接线
 
 | MSPM0 LP-G3507 | 目标 | 说明 |
 |---|---|---|
-| `PA9` (UART1 RX) | K230 `IO9` (TX) | 钢球位置数据 |
-| `PA8` (UART1 TX) | K230 `IO10` (RX) | 可选调试回传 |
-| `PA6` (TIMG0 C0) | MG996 信号线 | 50Hz PWM |
-| `PA10/PA11` | XDS110 USB | 调试串口 115200 |
-| `3V3 / GND` | LaunchPad 供电 | USB 或电池 |
-| `GND` | K230 GND + MG996 电源 GND | 必须共地！ |
+| `PB16` (UART2 RX) | K230 `IO9` (TX) | 钢球位置 AA 55 帧 |
+| `PA21` (UART2 TX) | K230 `IO10` (RX) | 可选调试回传 |
+| `PA8` (GPIO) | MG996 信号线 | 软件 PWM 50Hz, 1000-2000µs |
+| `PB2/PB3` (I2C1) | OLED SSD1306 SCL/SDA | 菜单显示 |
+| `PB15/17/18/19` | 按键 S1/S2/S3/S4 | 菜单导航 |
+| `GND` | K230 GND + MG996 GND | 必须共地！ |
 
-**MG996 供电**：独立大电流电源（>2A），正极**不**接 MSPM0。
-仅 GND 与 MSPM0 共地。
+**MG996 供电**：独立 5V/>2A 电源。仅 GND 与 MSPM0 共地，正极不接 MSPM0。
 
 ## 构建
 
@@ -24,82 +23,115 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\build.ps1
 ```
 
-产出 `msp_control.out`。用 CCS 或 DSLite 烧录。
+产出 `msp_control.out`（~16 KB flash / ~1.5 KB RAM）。
 
-## 首次上电步骤（严格按顺序！）
+## 烧录
 
-### 第 1 步：无球空载，确认舵机不异常
+```powershell
+C:\ti\ccs2100\ccs\ccs_base\DebugServer\bin\DSLite.exe flash `
+  -c targetConfigs\MSPM0G3507.ccxml `
+  -l msp_control.out
+```
 
-1. MG996 先不接连杆，或连杆脱开
-2. 烧录固件，连接调试串口 (115200)
-3. 启动 K230（运行 `k230_yolo.py`）
-4. 观察串口输出：`Mode=IDLE`，舵机应不动（或微动到 0 脉宽）
+或用 CCS Theia 通过 `targetConfigs/MSPM0G3507.ccxml` 烧录。
 
-### 第 2 步：标定中位脉宽
+## 操作方式
 
-1. 接通 MG996 电源
-2. 发送 `m1`（MODE_LINE_STOP），舵机输出 1500µs
-3. 如果摆杆不在水平位置，修改 `SERVO_NEUTRAL_US` 后重新编译
-4. 找到让摆杆水平的精确脉宽值
+OLED 菜单 + 4 按键：
 
-### 第 3 步：标定 ±8° 机械限位
+| 按键 | 功能 |
+|------|------|
+| S1 | 在菜单项间切换 |
+| S2 | 进入选中功能 |
+| S3 | 停止当前功能 |
+| S4 | 返回主菜单 |
 
-1. 修改 `SERVO_MIN_US` / `SERVO_MAX_US` 到 ±8° 对应的脉宽
-2. **确认连杆在极限位置不会进入死点或顶死**
-3. 机械限位必须先于舵机硬顶
+`Static Ball` → S2 → 自动执行：+5cm → -5cm → 保持（±0.2cm 死区）
 
-### 第 4 步：标定方向
+## AA 55 视觉帧协议
 
-1. 发送 `m2 t+5.0 go` → 舵机应驱动摆杆使球滚向 +5cm
-2. 如果球滚向反方向，修改 `SERVO_DIRECTION` 为 `-1.0f`
-3. 重新编译重试
+K230 → MSPM0，115200 8N1。
 
-### 第 5 步：视觉标定（见下文）
+```
+Byte  0:   0xAA          帧头 0
+Byte  1:   0x55          帧头 1
+Byte  2:   length        负载长度 + 2 (= 8 for vision)
+Byte  3:   type          消息类型 (0x01 = vision target)
+Byte  4:   sequence      帧序号 0-255
+Byte  5:   flags         bit0=valid, bit1=tracked
+Byte  6-7: xCmX100       钢球 X 坐标 (cm × 100, int16 LE)
+Byte  8-9: yOffsetPx     钢球 Y 偏移 (像素, int16 LE)
+Byte 10:   quality       检测置信度 0-255
+Byte 11:   checksum      字节 2-10 的和 (mod 256)
+```
 
-### 第 6 步：PD 调参
+最小帧长 = 2(头) + 1(长度) + 1(类型) + 1(序号) + 6(负载) + 1(校验) = 12 字节。
 
-## 调试串口命令
+## 静态滚球控制（任务 3）
 
-| 命令 | 含义 |
-|---|---|
-| `m0` | IDLE（停止舵机） |
-| `m1` | LINE_STOP（中位保持） |
-| `m2` | STATIC_BALL（静态滚球模式） |
-| `m3` | DYN_AB |
-| `m4` | DYN_LAP_CENTER |
-| `m5` | DYN_LAP_TARGET |
-| `t+5.0` | 设定目标 +5.0 cm |
-| `t-5.0` | 设定目标 -5.0 cm |
-| `t0` | 设定目标 0 cm |
-| `pk0.80` | 设定 Kp |
-| `dk0.15` | 设定 Kd |
-| `ik0.01` | 设定 Ki |
-| `go` | 切换到 STATIC_BALL 模式 |
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| 控制周期 | 10ms | StaticBall_Task 轮询 |
+| 移动倾角 | ±12° | 去目标位置时 |
+| 保持倾角 | ±8° | 在目标位置死区内 |
+| 死区 | ±0.2cm | 目标 ± 死区内倾角=0 |
+| 到达判定 | ±0.5cm | 距目标 0.5cm 内算到达 |
+| 视觉超时 | 200ms | 超时脱开舵机 |
+| 连续无效帧 | 3 帧 | 超过脱开舵机 |
+| 最小置信度 | 1 | quality >= 1 才接受 |
+
+相序：WAIT_VISION → TO_POS(+5cm) → TO_NEG(-5cm) → HOLD_NEG(保持)
+
+## 舵机控制
+
+| 参数 | 值 |
+|------|-----|
+| 引脚 | PA8 (IOMUX_PINCM19)，软件 PWM |
+| 频率 | 50Hz (20ms 周期) |
+| 脉冲范围 | 1000µs (0°) - 2000µs (180°) |
+| 中位 | 1500µs (90°) |
+| 方向 | SERVO_DIRECTION = -1.0（翻转倾角方向） |
+
+## 安全保护
+
+| 故障 | 行为 |
+|------|------|
+| UART 200ms 无有效帧 | 舵机脱开 |
+| 连续 3 帧无效 | 舵机脱开 |
+| 舵机角度 | 软件限制 0-180° |
+| 舵机脱开 | 引脚拉低，无 PWM 脉冲 |
+
+## 首次上电步骤
+
+### 1. 无球空载，确认舵机安全
+- MG996 不接连杆
+- 烧录固件，进入 `Static Ball` 菜单
+- 舵机应保持不动（无有效视觉帧 → 脱开）
+
+### 2. 标定中位
+- 连接连杆机构
+- 修改 `STATIC_BALL_SERVO_NEUTRAL_DEG` 使摆杆水平
+- 重新编译烧录
+
+### 3. 标定方向
+- 观察球滚动方向
+- 如果反了，修改 `STATIC_BALL_SERVO_DIRECTION` 为 `1.0f`
+
+### 4. 视觉标定
+- 相机固定后运行 `k230_code/k230_yolo.py`
+- 用 `k230_code/k230_calibrate.py` 做五点标定
+- 更新 `ZERO_X_PX` 和 `PX_PER_CM`
 
 ## 视觉标定（pixel → cm）
 
-相机固定后，执行五点标定：
+五点在管子上标记 +5, 0, -5 cm 位置：
+1. 依次放钢球，记录 YOLO 输出的 cx 像素值
+2. `PX_PER_CM = (cx_+5 - cx_-5) / 10.0`
+3. `ZERO_X_PX = cx_0cm`
+4. 更新 `k230_yolo.py` 中的值
 
-1. 在管子上标记 `-10, -5, 0, +5, +10 cm` 位置
-2. 依次放钢球，运行 `k230_code/k230_yolo.py`
-3. 记录每个位置 YOLO 输出的 `cx` 像素值
-4. 计算：`PX_PER_CM = (cx_+10 - cx_-10) / 20.0`
-5. 计算：`ZERO_X_PX = (cx_+10 + cx_-10) / 2.0`（或直接取 cx_0cm）
-6. 更新 `k230_yolo.py` 中的 `ZERO_X_PX` 和 `PX_PER_CM`
+## 架构说明
 
-## PD 调参顺序
-
-1. `Ki=0`，从 `Kp=0.40` 开始，每次 +0.20
-2. 当球出现 1-2 次超调后停止增大 Kp
-3. 从 `Kd=0.05` 开始逐步增大，直到超调消失
-4. `-5/0/+5 cm` 各测试 10 次，目标：5s 内稳定且误差 ≤0.8cm
-5. PD 通过后才考虑加入 Ki
-
-## 故障保护（自动）
-
-| 故障 | MSPM0 行为 |
-|---|---|
-| K230 停止/UART 断开 | 200ms 后限速 20°/s 回中位 |
-| 连续坏帧 ≥3 | 同上 |
-| 球进入端部危险区 | 目标自动向内修正 1.5cm |
-| 任何情况 | 摆角 ≤ ±8°, 角速度 ≤ 45°/s |
+- **SysConfig**：仅配置 I2C1 (OLED)。其余外设全用 `DL_xxx` driverlib API 直驱
+- **无 RTOS**：裸机主循环，SysTick 1KHz 系统时钟
+- **无 IMU**：当前纯视觉控制。MPU-6050 驱动在 `ti_mpu6050_test/` 待集成

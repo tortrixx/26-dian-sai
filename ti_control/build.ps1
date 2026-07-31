@@ -55,17 +55,19 @@ try {
     )
 
     # ---- Compile ----
+    $srcFiles = @(
+        "empty.c", "app.c", "buttons.c", "encoder.c", "k230_uart.c",
+        "line_follow.c", "line_sensor.c", "menu.c", "motor.c",
+        "oled.c", "servo.c", "static_ball.c", "system_time.c",
+        "ti_msp_dl_config.c", "startup_mspm0g350x_ticlang.c"
+    )
     $objs = @()
-    foreach ($s in @("msp_control.c", "ti_msp_dl_config.c")) {
+    foreach ($s in $srcFiles) {
         $o = [System.IO.Path]::ChangeExtension($s, ".obj")
         & $compiler @cOpts -c $s -o $o
         if ($LASTEXITCODE -ne 0) { throw "$s compile failed ($LASTEXITCODE)." }
         $objs += $o
     }
-
-    & $compiler @cOpts -c $startup -o startup_mspm0g350x_ticlang.obj
-    if ($LASTEXITCODE -ne 0) { throw "startup compile failed ($LASTEXITCODE)." }
-    $objs += "startup_mspm0g350x_ticlang.obj"
 
     # ---- Link ----
     $linkOpts = @(
@@ -77,7 +79,7 @@ try {
         "-Wl,-m,msp_control.map",
         "-Wl,--rom_model", "-Wl,--warn_sections",
         "-L$(Join-Path $CompilerRoot 'lib')",
-        "-llibc.a", "-llibm.a",
+        "-llibc.a",
         "-o", "msp_control.out"
     )
 
