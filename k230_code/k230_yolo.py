@@ -504,6 +504,7 @@ except Exception:
 
 pc_sock = None
 last_pc_cool_ms = 0    # Wi-Fi reconnect cool-down
+last_wifi_retry_ms = 0 # WiFi association retry cool-down
 
 video_count = 0
 video_bytes = 0
@@ -580,6 +581,15 @@ while True:
 
     # 4. WiFi streaming (non-blocking, lower priority than detection+UART)
     wifi_ok = (wlan is not None) and wlan.isconnected()
+    if not wifi_ok and wlan is not None:
+        # Yahboom v1.4.3 固件已知问题：WiFi 偶发关联失败 ("run connect failed"，
+        # 官方建议断电重启)。这里每 WIFI_RETRY_MS 重试关联，自愈，无需断电。
+        if _ticks_diff(now_ms, last_wifi_retry_ms) >= WIFI_RETRY_MS:
+            last_wifi_retry_ms = now_ms
+            try:
+                wlan.connect(WIFI_SSID, WIFI_PASS)
+            except Exception:
+                pass
     if pc_sock is None and wifi_ok:
         if _ticks_diff(now_ms, last_pc_cool_ms) >= PC_RETRY_MS:
             last_pc_cool_ms = now_ms
