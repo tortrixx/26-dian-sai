@@ -52,7 +52,9 @@ MAX_BOXES = 10
 
 # ---- Vision / tracking ----
 # Pixel-to-cm calibration.  Calibrated 2026-07-31 with real steel ball.
-ZERO_X_PX = 345.0
+# 2026-08-01: 原点实测 x=-2.5cm → 零位修正 345.0 → 294.75 (345.0 - 2.5*20.1)。
+# 相机若再移动需用 k230_calibrate.py 重新标定。
+ZERO_X_PX = 294.75
 PX_PER_CM = 20.1
 PIPE_ROI = (0, 120, 640, 240)
 
@@ -88,10 +90,13 @@ WIFI_RETRY_MS = 8000
 PC_RETRY_MS = 3000
 
 # Streaming (JPEG over TCP)
+# fps 是节流上限（VIDEO_INTERVAL_MS），实际帧率 = 主循环速率（YOLO NPU 推理时
+# CPU 空闲，可穿插 JPEG 编码，实测 ~20fps）。Q 提高几乎不增加编码耗时（硬件 JPEG），
+# 只增帧体积：640x240 Q55 ≈ 10-13KB/帧 × 20fps ≈ 2Mbps，WiFi 余量充足。
 STREAM_PROFILE = "pipe_detail"
 STREAM_PROFILES = {
     "control":     (320, 240, 8, 70),
-    "pipe_detail": (640, 240, 6, 50),
+    "pipe_detail": (640, 240, 25, 55),
 }
 VIDEO_W, VIDEO_H, VIDEO_TARGET_FPS, JPEG_Q = STREAM_PROFILES[STREAM_PROFILE]
 VIDEO_INTERVAL_MS = max(1, 1000 // VIDEO_TARGET_FPS)
@@ -612,7 +617,7 @@ while True:
 
     # 6. GC — reduced allocations, run even less often
     frame_index += 1
-    if frame_index % 200 == 0:         # ~7 seconds
+    if frame_index % 150 == 0:         # ~7 seconds (JPEG 帧体积变大, GC 更勤一点)
         try:
             gc.collect()
         except Exception:
