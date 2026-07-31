@@ -286,41 +286,25 @@ class VideoSender:
 
 # ============ WiFi helpers ============
 
-def wifi_connect_once():
+def wifi_init_nonblock():
+    """Init WiFi once — connect() runs async, never blocks the main loop."""
     try:
         wlan = network.WLAN(network.STA_IF)
         wlan.active(True)
-        if not wlan.isconnected():
-            wlan.connect(WIFI_SSID, WIFI_PASS)
-            deadline = time.ticks_ms() + 8000
-            while not wlan.isconnected():
-                if _ticks_diff(time.ticks_ms(), deadline) > 0:
-                    break
-                time.sleep_ms(50)
+        wlan.connect(WIFI_SSID, WIFI_PASS)
+        print("[K230] WiFi connecting (non-blocking)...")
         return wlan
-    except Exception:
+    except Exception as e:
+        print("[K230] WiFi init failed:", e)
         return None
 
 
-def wifi_ready(wlan, now_ms, last_attempt_ms):
-    if wlan is None:
-        return False, last_attempt_ms
-    if wlan.isconnected():
-        return True, last_attempt_ms
-    if _ticks_diff(now_ms, last_attempt_ms) < WIFI_RETRY_MS:
-        return False, last_attempt_ms
-    try:
-        wlan.connect(WIFI_SSID, WIFI_PASS)
-    except Exception:
-        pass
-    return wlan.isconnected(), now_ms
-
-
-def pc_connect_once():
+def pc_connect_nonblock():
+    """Try PC connect without blocking the detection loop."""
     try:
         addr = socket.getaddrinfo(PC_IP, PC_PORT)[0][-1]
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(VIDEO_CONNECT_TIMEOUT_S)
+        sock.settimeout(0.05)  # 50ms max — don't block detection
         sock.connect(addr)
         sock.setblocking(False)
         print("[K230] PC video receiver connected")
@@ -454,11 +438,17 @@ clock = time.clock()
 
 frame_index = 0
 last_video_enqueue_ms = 0
-last_pc_attempt_ms = 0
-last_wifi_attempt_ms = 0
+last_pc_cool_ms = 0
 
 wlan = None
+try:
+    wlan = wifi_init_nonblock()
+except Exception:
+    pass
+
 pc_sock = None
+# IPC reconnection uses a dedicated cool-down so we don't hammer the PC.
+last_pc_cool_ms = 0
 
 video_stat_start_ms = time.ticks_ms()
 video_count = 0
@@ -534,15 +524,12 @@ while True:
         tracker.miss()
         send_ball(False, 0, 0, 0, tracker.ready)
 
-    # 4. WiFi connection management
-    if wlan is None and frame_index % 50 == 0:
-        wlan = wifi_connect_once()
-    if wlan is not None:
-        wifi_is_ready, last_wifi_attempt_ms = wifi_ready(wlan, now_ms, last_wifi_attempt_ms)
-        if (pc_sock is None and wifi_is_ready and
-                _ticks_diff(now_ms, last_pc_attempt_ms) >= PC_RETRY_MS):
-            last_pc_attempt_ms = now_ms
-            pc_sock = pc_connect_once()
+    # 4. WiFi / streaming (non-blocking — detection always takes priority)
+    wifi_ok = (wlan is not None) and wlan.isconnected()
+    if pc_sock is None and wifi_ok:
+        if _ticks_diff(now_ms, last_pc_cool_ms) >= PC_RETRY_MS:
+            last_pc_cool_ms = now_ms
+            pc_sock = pc_connect_nonblock()
 
     # 5. JPEG encoding & streaming (from CHN_0 RGB565)
     if (pc_sock is not None and not video_sender.pending() and
@@ -573,7 +560,7 @@ while True:
             except Exception:
                 pass
             pc_sock = None
-            last_pc_attempt_ms = now_ms  # don't reconnect immediately
+            last_pc_cool_ms = now_ms  # don't reconnect immediately
             video_sender.reset()
 
     # 6. Status & GC

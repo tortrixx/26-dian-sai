@@ -19,9 +19,20 @@
 #define STATIC_BALL_SERVO_DIRECTION              (-1.0f)
 #define STATIC_BALL_SERVO_DEG_PER_TILT_DEG       1.0f
 
-/* Simple bang-bang control: only decide which side of the target the ball is on. */
-#define STATIC_BALL_MOVE_TILT_DEG                12
-#define STATIC_BALL_HOLD_TILT_DEG                8
+/*
+ * Bang-bang tilt magnitudes — two independent values per direction because
+ * the mechanical linkage rarely converts servo angle to pipe tilt symmetrically.
+ *
+ * "LEFT"  = ball left of target → positive tiltDeg → servo moves one way
+ * "RIGHT" = ball right of target → negative tiltDeg → servo moves the other way
+ *
+ * If one direction is too weak or too strong, tune the matching value here.
+ * A larger number = steeper pipe angle = faster ball.
+ */
+#define STATIC_BALL_MOVE_TILT_LEFT_DEG           12  /* ball-left, move phase */
+#define STATIC_BALL_MOVE_TILT_RIGHT_DEG          12  /* ball-right, move phase */
+#define STATIC_BALL_HOLD_TILT_LEFT_DEG           8   /* ball-left, hold phase */
+#define STATIC_BALL_HOLD_TILT_RIGHT_DEG          8   /* ball-right, hold phase */
 
 typedef enum {
     STATIC_BALL_PHASE_WAIT_VISION = 0,
@@ -284,11 +295,11 @@ void StaticBall_Task(void)
     targetX100 = gStatus.targetCmX100;
     if (frame.xCmX100 < (targetX100 - STATIC_BALL_DIRECTION_DEADBAND_CM_X100)) {
         tiltDeg = (gPhase == STATIC_BALL_PHASE_HOLD_NEG) ?
-            STATIC_BALL_HOLD_TILT_DEG : STATIC_BALL_MOVE_TILT_DEG;
+            STATIC_BALL_HOLD_TILT_LEFT_DEG : STATIC_BALL_MOVE_TILT_LEFT_DEG;
     } else if (frame.xCmX100 >
         (targetX100 + STATIC_BALL_DIRECTION_DEADBAND_CM_X100)) {
         tiltDeg = (gPhase == STATIC_BALL_PHASE_HOLD_NEG) ?
-            -STATIC_BALL_HOLD_TILT_DEG : -STATIC_BALL_MOVE_TILT_DEG;
+            -STATIC_BALL_HOLD_TILT_RIGHT_DEG : -STATIC_BALL_MOVE_TILT_RIGHT_DEG;
     } else {
         tiltDeg = 0;
     }
