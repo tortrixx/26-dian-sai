@@ -51,9 +51,11 @@ NMS_THRESH = 0.45
 MAX_BOXES = 10
 
 # ---- Vision / tracking ----
-# Pixel-to-cm calibration.  Calibrated 2026-07-31 with real steel ball.
-ZERO_X_PX = 345.0
-PX_PER_CM = 20.1
+# Pixel-to-cm calibration.
+# 2026-08-01 五点重标（相机侧移~2cm 且前移，比例尺变化 20.1→21.82）:
+#   (-10,77.0) (-5,186.5) (0,295.5) (+5,405.5) (+10,513.0) → 线性回归
+ZERO_X_PX = 295.5
+PX_PER_CM = 21.82
 PIPE_ROI = (0, 120, 640, 240)
 
 # BallTracker state machine — SEARCH→CONFIRM(2)→TRACK→HOLD(3)→LOST
