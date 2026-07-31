@@ -2,8 +2,8 @@
 import serial, time, base64
 
 COM = 'COM6'
-LOCAL = r'C:\Users\sznnn\Desktop\26-dian-sai\k230_code\k230_final.py'
-REMOTE = '/sdcard/app/k230_final.py'
+LOCAL = r'C:\Users\sznnn\Desktop\26-dian-sai\k230_code\k230_yolo.py'
+REMOTE = '/sdcard/app/k230_yolo.py'
 
 ser = serial.Serial(COM, 115200, timeout=0.5)
 
