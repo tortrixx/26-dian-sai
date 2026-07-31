@@ -244,7 +244,10 @@ static void Menu_RenderPage(void)
             }
             Oled_DrawString(0, 32, line);
 
-            if (target < 0) {
+            if (staticBallStatus.phase == 0U) {
+                (void)snprintf(line, sizeof(line), "TST S:%d",
+                    staticBallStatus.servoAngleDeg);
+            } else if (target < 0) {
                 (void)snprintf(line, sizeof(line), "P:%u G:-%d.%02d S:%d",
                     staticBallStatus.phase,
                     (int)(-target / 100), (int)(-target % 100),

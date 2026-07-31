@@ -54,7 +54,7 @@ except Exception:
     pass
 
 
-DETECTION_MODE = "motion"  # "blobs" | "circles" | "motion" (帧差法——球是唯一移动的)
+DETECTION_MODE = "circles"  # "blobs" | "circles" | "motion"
 
 # Image preprocessing — amplify subtle contrast between steel ball and pipe.
 # CLAHE (adaptive histogram equalization) stretches local brightness differences.
@@ -69,8 +69,8 @@ PREPROCESS_CONTRAST = 1.0     # Contrast multiplier >1 increases ball vs pipe ga
 # find_circles() detects circular edges regardless of brightness — ideal for
 # a steel ball that blends into the pipe surface in top-down view.
 CIRCLE_R_MIN = 3     # 最小半径 px，排除噪点
-CIRCLE_R_MAX = 10    # 最大半径 px。1cm球俯视通常 5-8px 半径
-CIRCLE_THRESHOLD = 1200  # 窄条ROI下降低阈值，捕捉更弱的球边缘
+CIRCLE_R_MAX = 12    # 最大半径 px。1cm球俯视通常 5-8px 半径
+CIRCLE_THRESHOLD = 800   # 降低阈值提高灵敏度，配合BallTracker过滤误检
 CIRCLE_ROI_MARGIN = 10   # circle ROI 在 pipe ROI 基础上各边外扩 px
 
 # ---- 1. Wire protocol.  Keep this self-contained for /sdcard deployment. ----
@@ -213,10 +213,14 @@ calibration_sum_h = 0.0
 calibration_sum_quality = 0.0
 calibration_diagnostic_frames = 0
 
-# Alpha-beta tracking and reacquisition.
-TRACK_MISS_LIMIT = 12   # motion模式检测稀疏，提高容错避免频繁丢锁
-ALPHA = 0.65
-BETA = 0.12
+# BallTracker state machine — ported from xiazetao085-debug/k230-steel-ball-detection.
+# SEARCH → CONFIRM(2 consistent detections) → TRACK → HOLD(3 misses) → LOST
+CONFIRM_DETECTIONS = 2       # consecutive consistent frames to lock on
+MISS_HOLD_DETECTIONS = 3     # misses before declaring LOST (was 25, now state-driven)
+MAX_TRACK_JUMP_PX = 60       # px — reject wild false positives (~5cm equivalent)
+FILTER_ALPHA = 0.35          # exponential smoothing for position
+PIPE_CENTER_TOLERANCE = 22   # px — reject detections far from pipe centerline
+TRACK_MISS_LIMIT = 25        # kept for compatibility with use_local_roi()
 
 # UART: K230 TX -> MSPM0 RX, K230 RX <- MSPM0 TX (optional), and common ground.
 UART_BAUD = 115200
@@ -317,7 +321,7 @@ OVERLAY_TEXT_SIZE = 20
 # Set False only for a 30 s Wi-Fi/JPEG benchmark before the steel ball arrives.
 # Normal competition operation must keep this True.
 VISION_ENABLE = True
-PERFORMANCE_LOG = True
+PERFORMANCE_LOG = False
 # ===============================================================================
 
 
@@ -589,9 +593,9 @@ def _find_best_circle(img, roi, predicted_x, using_track_roi):
 # Motion detection via column-profile background subtraction.
 # The ball is the only moving object in the pipe strip.  We model the pipe
 # surface as a per-column brightness profile and flag deviations.
-MOTION_COL_STEP = 8        # 每8列采样 (40点)，FPS充裕可加强信号
+MOTION_COL_STEP = 16       # 每16列采样 (20点)，减少统计调用提升FPS
 MOTION_BG_LEARN_RATE = 0.015 # 背景每秒更新~50%，球停下2秒后融入背景
-MOTION_MIN_DEVIATION = 1.5   # 降低阈值捕捉慢速微动 (原1.8)
+MOTION_MIN_DEVIATION = 1.0   # 配合16px宽列组，补偿信号减弱
 MOTION_SKIP_FRAMES = 0       # 暂不跳帧——先收集稳定数据做五点标定
 
 
@@ -611,13 +615,17 @@ def _motion_reset_background():
     _motion_col_x_cache = None
 
 
-def _find_ball_motion(img, roi):
+def _find_ball_motion(img, roi, tracked=False):
     """Detect the ball by column-profile deviation from a running background.
 
     The pipe surface is modelled as one mean-L value per small column group.
     A rolling steel ball locally darkens or brightens those columns, creating
     a spike in the deviation profile.  This works even when the ball has zero
     contrast against the pipe in a single static frame.
+
+    When *tracked* is True the background is NOT updated at the columns
+    covering the detected ball, preventing a stationary ball from fading
+    into the background model after ~2 s.
     """
     global _motion_bg_profile, _motion_bg_ready, _motion_bg_frame_count
     global _motion_col_x_cache
@@ -684,10 +692,19 @@ def _find_ball_motion(img, roi):
     # Quality scales with peak deviation: 3 L → q=30, 10 L → q=90
     quality = int(_clamp(peak_val * 9.0, 10, 90))
 
-    # 6. Slowly update background at all columns — stationary ball fades in ~2s.
-    bg_lr = MOTION_BG_LEARN_RATE
-    for i in range(num_cols):
-        _motion_bg_profile[i] += bg_lr * (cur_profile[i] - _motion_bg_profile[i])
+    # 6. Update background — skip ball columns when tracking to prevent fade.
+    if tracked:
+        ball_col_start = max(0, peak_idx - 2)
+        ball_col_end = min(num_cols, peak_idx + 3)
+        bg_lr = MOTION_BG_LEARN_RATE
+        for i in range(num_cols):
+            if ball_col_start <= i < ball_col_end:
+                continue
+            _motion_bg_profile[i] += bg_lr * (cur_profile[i] - _motion_bg_profile[i])
+    else:
+        bg_lr = MOTION_BG_LEARN_RATE
+        for i in range(num_cols):
+            _motion_bg_profile[i] += bg_lr * (cur_profile[i] - _motion_bg_profile[i])
 
     return ball_cx, quality
 
@@ -900,57 +917,137 @@ def _calibration_sample(blob, quality):
     calibration_sum_quality = 0.0
 
 
-class AlphaBetaTracker:
+class BallTracker:
+    """SEARCH → CONFIRM(2) → TRACK → HOLD(3miss) → LOST state machine.
+
+    Ported from xiazetao085-debug/k230-steel-ball-detection.  A single spurious
+    detection cannot hijack the output; two consistent frames must agree before
+    the tracker locks on.  During brief occlusions (up to MISS_HOLD_DETECTIONS
+    frames) the last valid position is held.  Wild jumps (>MAX_TRACK_JUMP_PX)
+    are rejected as false positives.
+
+    Interface is drop-in compatible with the old AlphaBetaTracker so no
+    call-site changes are needed in detect_ball() or send_ball().
+    """
+
+    SEARCH = 0
+    CONFIRM = 1
+    TRACK = 2
+    HOLD = 3
+    LOST = 4
+
+    _STATE_NAMES = {0: "SEARCH", 1: "CONFIRM", 2: "TRACK", 3: "HOLD", 4: "LOST"}
+
     def __init__(self):
-        self.ready = False
-        self.x = float(ZERO_X_PX)
-        self.v = 0.0
-        self.last_ms = 0
-        self.misses = 0
-        self.polarity = None
+        self.state = self.SEARCH
+        self._x = float(ZERO_X_PX)       # filtered position (px, vision coords)
+        self._last_ms = 0
+        self._misses = 0
+        self._confirm_count = 0
+        self._pending_x = 0.0
+        self._polarity = None            # retained for blob-mode compatibility
+
+    # ---- read-only properties (drop-in for old AlphaBetaTracker fields) ----
+
+    @property
+    def ready(self):
+        """Tracker has a confirmed lock on the ball."""
+        return self.state in (self.TRACK, self.HOLD)
+
+    @property
+    def misses(self):
+        return self._misses
+
+    @property
+    def polarity(self):
+        return self._polarity
+
+    # ---- core API ----
 
     def predicted_x(self, now_ms):
-        if not self.ready:
-            return float(ZERO_X_PX)
-        dt_s = _clamp(_ticks_diff(now_ms, self.last_ms) / 1000.0, 0.0, 0.25)
-        return self.x + self.v * dt_s
-
-    def update(self, measured_x, now_ms, polarity=None):
-        measured_x = float(measured_x)
-        if polarity is not None:
-            self.polarity = polarity
-        if not self.ready:
-            self.ready = True
-            self.x = measured_x
-            self.v = 0.0
-            self.last_ms = now_ms
-            self.misses = 0
-            return self.x
-
-        dt_s = _clamp(_ticks_diff(now_ms, self.last_ms) / 1000.0, 0.001, 0.25)
-        prediction = self.x + self.v * dt_s
-        residual = measured_x - prediction
-        self.x = prediction + ALPHA * residual
-        self.v = _clamp(self.v + BETA * residual / dt_s,
-                        -MAX_TRACK_SPEED_PX_S, MAX_TRACK_SPEED_PX_S)
-        self.last_ms = now_ms
-        self.misses = 0
-        return self.x
-
-    def miss(self):
-        self.misses += 1
-
-    def predict_only(self, now_ms):
-        """Advance state without a measurement for frame-skipping."""
-        if not self.ready:
-            return float(ZERO_X_PX)
-        dt_s = _clamp(_ticks_diff(now_ms, self.last_ms) / 1000.0, 0.001, 0.25)
-        self.x = self.x + self.v * dt_s
-        self.last_ms = now_ms
-        return self.x
+        """Best-guess ball x (px) right now.  No velocity model — SMA only."""
+        return self._x
 
     def use_local_roi(self):
-        return self.ready and self.misses < TRACK_MISS_LIMIT
+        """True when the search window can be narrowed around the last position."""
+        return self.state in (self.TRACK, self.HOLD)
+
+    def state_name(self):
+        return self._STATE_NAMES.get(self.state, "?")
+
+    def update(self, measured_x, now_ms, polarity=None):
+        """Feed a new measurement (px, vision-image frame).
+
+        Returns the filtered x position.  Internally runs the state machine:
+        - SEARCH → CONFIRM on first sighting
+        - CONFIRM → TRACK after CONFIRM_DETECTIONS consistent hits
+        - TRACK → HOLD on a miss, HOLD → LOST after too many misses
+        - Measurements that jump >MAX_TRACK_JUMP_PX from the current lock are
+          treated as misses (false-positive rejection).
+        """
+        measured_x = float(measured_x)
+        if polarity is not None:
+            self._polarity = polarity
+
+        # --- LOST: restart the confirm cycle ---
+        if self.state == self.LOST:
+            self._pending_x = measured_x
+            self._confirm_count = 1
+            self.state = self.CONFIRM
+            return self._pending_x
+
+        # --- SEARCH: first ever sighting ---
+        if self.state == self.SEARCH:
+            self._pending_x = measured_x
+            self._confirm_count = 1
+            self.state = self.CONFIRM
+            return self._pending_x
+
+        # --- CONFIRM: need consistent detections before locking ---
+        if self.state == self.CONFIRM:
+            jump = abs(measured_x - self._pending_x)
+            if jump <= MAX_TRACK_JUMP_PX:
+                self._confirm_count += 1
+                # running average of confirm candidates (reduces jitter on lock)
+                self._pending_x = self._pending_x * 0.6 + measured_x * 0.4
+                if self._confirm_count >= CONFIRM_DETECTIONS:
+                    self.state = self.TRACK
+                    self._x = self._pending_x
+                    self._misses = 0
+                    self._last_ms = now_ms
+                return self._pending_x
+            # inconsistent — restart confirmation from the new position
+            self._pending_x = measured_x
+            self._confirm_count = 1
+            return self._pending_x
+
+        # --- TRACK / HOLD: normal tracking ---
+        jump = abs(measured_x - self._x)
+        if jump <= MAX_TRACK_JUMP_PX:
+            # good measurement — smooth it in
+            if self.state == self.HOLD:
+                self.state = self.TRACK  # recovery
+            self._x = self._x * (1.0 - FILTER_ALPHA) + measured_x * FILTER_ALPHA
+            self._misses = 0
+            self._last_ms = now_ms
+            return self._x
+        # wild jump — treat as a miss (false positive)
+        self.miss()
+        return self._x
+
+    def miss(self):
+        """Called once per frame when the detector found no ball."""
+        self._misses += 1
+        if self.state == self.TRACK:
+            self.state = self.HOLD
+        elif self.state == self.HOLD and self._misses >= MISS_HOLD_DETECTIONS:
+            self.state = self.LOST
+            self._confirm_count = 0
+        # SEARCH, CONFIRM, LOST: stay where they are on a miss
+
+    def predict_only(self, now_ms):
+        """Frame-skip path: return last position, no state change."""
+        return self._x
 
 
 def detect_ball(img, tracker, now_ms):
@@ -986,20 +1083,27 @@ def detect_ball(img, tracker, now_ms):
             _motion_skip_counter = 0
 
         if do_detect:
-            ball_cx, quality = _find_ball_motion(img, search_roi)
+            ball_cx, quality = _find_ball_motion(img, search_roi, tracked)
 
         if do_detect and ball_cx is not None:
             # Detection succeeded — update tracker with measurement.
             ball_cy = PIPE_CENTER_Y
             filtered_x_px = tracker.update(ball_cx, now_ms)
         elif not do_detect:
-            # Skip frame — predict from velocity, keep tracking alive.
+            # Skip frame — predict from last known position.
             filtered_x_px = tracker.predict_only(now_ms)
-            # Use last known quality; clip to moderate confidence.
             quality = 50
             ball_cx = int(filtered_x_px)
             ball_cy = PIPE_CENTER_Y
+        elif tracker.ready:
+            # No detection but tracker is in TRACK/HOLD — coast on prediction.
+            tracker.miss()
+            filtered_x_px = tracker.predicted_x(now_ms)
+            quality = max(10, quality - 5)  # degrade quality during coasting
+            ball_cx = int(filtered_x_px)
+            ball_cy = PIPE_CENTER_Y
         else:
+            # No detection and tracker not locked — genuine LOST.
             tracker.miss()
             _draw_overlay_text(img, 2, 2, "NO BALL ({})".format(tracker.misses),
                                color=(255, 0, 0))
@@ -1023,18 +1127,28 @@ def detect_ball(img, tracker, now_ms):
         )
         if best is None:
             tracker.miss()
-            _draw_overlay_text(img, 2, 2, "NO BALL ({})".format(tracker.misses),
-                               color=(255, 0, 0))
-            return False, 0, 0, 0, tracked, None
-        circle_cx, circle_cy, circle_r_val, _ = best
+            if tracker.ready:
+                # Coast on prediction during brief HOLD.
+                circle_cx = int(tracker.predicted_x(now_ms))
+                circle_cy = PIPE_CENTER_Y
+                circle_r_val = 5
+                filtered_x_px = float(circle_cx)
+                quality = max(10, 30)
+            else:
+                _draw_overlay_text(img, 2, 2, "NO BALL ({})".format(tracker.misses),
+                                   color=(255, 0, 0))
+                return False, 0, 0, 0, tracked, None
+        else:
+            circle_cx, circle_cy, circle_r_val, _ = best
+            filtered_x_px = tracker.update(circle_cx, now_ms)
         if OVERLAY_ENABLE:
             img.draw_circle(circle_cx, circle_cy, circle_r_val,
                             color=(255, 0, 0), thickness=2)
             img.draw_cross(circle_cx, circle_cy, color=(0, 255, 0), size=10, thickness=2)
             _draw_overlay_text(img, 2, 2, "x={:.2f}cm q={}".format(
                 _pixel_to_cm(circle_cx), quality), color=(255, 255, 255))
-        _calibration_sample_circle(circle_cx, circle_cy, circle_r_val, quality)
-        filtered_x_px = tracker.update(circle_cx, now_ms)
+        if best is not None:
+            _calibration_sample_circle(circle_cx, circle_cy, circle_r_val, quality)
         x_cm = _pixel_to_cm(filtered_x_px)
         x_cm_x100 = int(round(x_cm * 100.0))
         y_offset_px = circle_cy - PIPE_CENTER_Y
@@ -1049,6 +1163,15 @@ def detect_ball(img, tracker, now_ms):
     )
     if best is None:
         tracker.miss()
+        if tracker.ready:
+            # Coast on prediction during brief HOLD.
+            filtered_x_px = tracker.predicted_x(now_ms)
+            quality = max(10, 30)
+            x_cm = _pixel_to_cm(filtered_x_px)
+            x_cm_x100 = int(round(x_cm * 100.0))
+            y_offset_px = 0
+            marker = (0, 0, 0, 0, filtered_x_px, PIPE_CENTER_Y)
+            return True, x_cm_x100, y_offset_px, quality, tracked, marker
         _draw_overlay_text(img, 2, 2, "NO BALL ({})".format(tracker.misses),
                            color=(255, 0, 0))
         return False, 0, 0, 0, tracked, None
@@ -1595,7 +1718,7 @@ vision_canvas = make_vision_canvas(vision_width, vision_height)
 VISION_INPUT_SCALE_X = VISION_W / float(vision_width)
 VISION_INPUT_SCALE_Y = VISION_H / float(vision_height)
 
-tracker = AlphaBetaTracker()
+tracker = BallTracker()
 clock = time.clock()
 wlan = wifi_start()
 pc_sock = None
@@ -1733,7 +1856,9 @@ while True:
         except Exception:
             pass
     if frame_index % 30 == 0:
-        state = "x={:.2f}cm q={}".format(x_cm_x100 / 100.0, quality) if valid else "NO BALL"
+        state = "x={:.2f}cm q={} [{}]".format(
+            x_cm_x100 / 100.0, quality, tracker.state_name()
+        ) if valid else "NO BALL [{}]".format(tracker.state_name())
         stat_elapsed_ms = max(1, _ticks_diff(now_ms, video_stat_start_ms))
         video_fps = video_count * 1000.0 / stat_elapsed_ms
         video_kb_s = video_bytes * 1000.0 / stat_elapsed_ms / 1024.0
@@ -1747,11 +1872,10 @@ while True:
                 perf_capture_ms / 30.0, perf_vision_ms / 30.0,
                 perf_jpeg_ms / 30.0, perf_send_ms / 30.0
             ))
-        else:
-            print("[K230] Loop:{:.1f} {} UART:{} Video:{:.1f}fps {:.1f}KB/s {}".format(
-                clock.fps(), state, uart_seq, video_fps, video_kb_s,
-                active_video_backend
-            ))
+        elif frame_index % 120 == 0:
+            # Lightweight status every ~4s (avoids REPL UART blocking)
+            print("[K230] {:.1f}fps {} UART:{}".format(
+                clock.fps(), state, uart_seq))
         video_count = 0
         video_bytes = 0
         video_stat_start_ms = now_ms

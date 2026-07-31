@@ -56,12 +56,14 @@ ZERO_X_PX = 345.0
 PX_PER_CM = 20.1
 PIPE_ROI = (0, 120, 640, 240)
 
-# Alpha-beta tracker
-TRACK_HALF_WIDTH_PX = 100
-MAX_TRACK_SPEED_PX_S = 700.0
-TRACK_MISS_LIMIT = 10
-ALPHA = 0.65
-BETA = 0.12
+# BallTracker state machine — SEARCH→CONFIRM(2)→TRACK→HOLD(3)→LOST
+# Prevents single-frame false positives from reaching MSPM0.
+CONFIRM_DETECTIONS = 2        # consistent frames to lock on
+MISS_HOLD_DETECTIONS = 3      # misses before LOST
+MAX_TRACK_JUMP_PX = 80        # ~4cm — reject wild position jumps
+FILTER_ALPHA = 0.35           # position EMA smoothing
+TRACK_HALF_WIDTH_PX = 100     # local ROI half-width when tracking
+TRACK_MISS_LIMIT = 10         # kept for use_local_roi() compat
 
 # ---- UART ----
 UART_BAUD = 115200
@@ -107,7 +109,7 @@ STREAM_OVERLAY_CROSS_COLOR = (0, 255, 0)
 STREAM_OVERLAY_THICKNESS = 2
 STREAM_OVERLAY_CROSS_SIZE = 12
 
-PERFORMANCE_LOG = True
+PERFORMANCE_LOG = False   # NEVER enable — print() blocks REPL UART, causes LOST
 VISION_ENABLE = True
 
 
@@ -133,78 +135,119 @@ def _put_i16_le(buf, offset, value):
     buf[offset + 1] = (value >> 8) & 0xFF
 
 def _ticks_diff(now, then):
-    try:
-        return time.ticks_diff(now, then)
-    except Exception:
-        return now - then
+    """MicroPython ticks diff — direct arithmetic, no try/except overhead."""
+    return now - then
+
+# Pre-allocated UART frame buffer to avoid per-frame GC pressure
+_UART_FRAME = bytearray(12)  # AA+55+len+type+seq+6B_payload+checksum = 12 bytes
 
 def build_vision_frame(seq, valid, x_cm_x100, y_offset_px, quality=0, tracked=False):
-    payload = bytearray(6)
+    """Fill pre-allocated buffer in-place.  Returns memoryview to avoid copy."""
     flags = 0
     if valid:
         flags |= VISION_FLAG_VALID
     if tracked:
         flags |= VISION_FLAG_TRACKED
-    payload[0] = flags
-    _put_i16_le(payload, 1, x_cm_x100)
-    _put_i16_le(payload, 3, y_offset_px)
-    payload[5] = _clamp(quality, 0, 255)
-    length = len(payload) + 2
-    frame = bytearray(2 + 1 + length + 1)
-    frame[0] = PROTO_HEAD_0
-    frame[1] = PROTO_HEAD_1
-    frame[2] = length
-    frame[3] = MSG_VISION_TARGET
-    frame[4] = seq & 0xFF
-    for index in range(len(payload)):
-        frame[5 + index] = payload[index]
-    frame[-1] = _checksum(frame, 2, len(frame) - 1)
-    return frame
+
+    _UART_FRAME[0] = PROTO_HEAD_0     # 0xAA
+    _UART_FRAME[1] = PROTO_HEAD_1     # 0x55
+    _UART_FRAME[2] = 8                 # length = 6 payload + 2
+    _UART_FRAME[3] = MSG_VISION_TARGET # type = 0x01
+    _UART_FRAME[4] = seq & 0xFF        # sequence
+    _UART_FRAME[5] = flags             # payload[0]
+    _put_i16_le(_UART_FRAME, 6, x_cm_x100)    # payload[1:3]
+    _put_i16_le(_UART_FRAME, 8, y_offset_px)  # payload[3:5]
+    _UART_FRAME[10] = _clamp(quality, 0, 255) # payload[5]
+    _UART_FRAME[11] = _checksum(_UART_FRAME, 2, 11)
+    return _UART_FRAME
 
 def pixel_to_cm(px_x):
     return (px_x - ZERO_X_PX) / PX_PER_CM
 
 
-# ============ Alpha-Beta Tracker ============
+# ============ BallTracker (state machine) ============
 
-class AlphaBetaTracker:
+class BallTracker:
+    """SEARCH → CONFIRM(2) → TRACK → HOLD(3miss) → LOST
+
+    Drop-in replacement for AlphaBetaTracker.  Two consistent YOLO detections
+    are required before locking; wild jumps (>MAX_TRACK_JUMP_PX) are rejected.
+    During brief HOLD the last position coasts, so MSPM0 never sees a spurious
+    single-frame gap.
+    """
+
+    SEARCH = 0; CONFIRM = 1; TRACK = 2; HOLD = 3; LOST = 4
+    _NAMES = {0: "S", 1: "C", 2: "T", 3: "H", 4: "L"}
+
     def __init__(self):
-        self.ready = False
-        self.x = ZERO_X_PX
-        self.v = 0.0
-        self.last_ms = 0
-        self.misses = 0
+        self.state = self.SEARCH
+        self._x = float(ZERO_X_PX)
+        self._misses = 0
+        self._confirm_count = 0
+        self._pending_x = 0.0
+
+    @property
+    def ready(self):
+        return self.state in (self.TRACK, self.HOLD)
+
+    @property
+    def misses(self):
+        return self._misses
+
+    def state_name(self):
+        return self._NAMES.get(self.state, "?")
 
     def predicted_x(self, now_ms):
-        if not self.ready:
-            return ZERO_X_PX
-        dt_s = _clamp(_ticks_diff(now_ms, self.last_ms) / 1000.0, 0.0, 0.25)
-        return self.x + self.v * dt_s
+        return self._x
+
+    def use_local_roi(self):
+        return self.state in (self.TRACK, self.HOLD)
 
     def update(self, measured_x, now_ms):
         measured_x = float(measured_x)
-        if not self.ready:
-            self.ready = True
-            self.x = measured_x
-            self.v = 0.0
-            self.last_ms = now_ms
-            self.misses = 0
-            return self.x
-        dt_s = _clamp(_ticks_diff(now_ms, self.last_ms) / 1000.0, 0.001, 0.25)
-        prediction = self.x + self.v * dt_s
-        residual = measured_x - prediction
-        self.x = prediction + ALPHA * residual
-        self.v = _clamp(self.v + BETA * residual / dt_s,
-                        -MAX_TRACK_SPEED_PX_S, MAX_TRACK_SPEED_PX_S)
-        self.last_ms = now_ms
-        self.misses = 0
-        return self.x
+
+        if self.state == self.LOST:
+            self._pending_x = measured_x
+            self._confirm_count = 1
+            self.state = self.CONFIRM
+            return self._pending_x
+
+        if self.state == self.SEARCH:
+            self._pending_x = measured_x
+            self._confirm_count = 1
+            self.state = self.CONFIRM
+            return self._pending_x
+
+        if self.state == self.CONFIRM:
+            if abs(measured_x - self._pending_x) <= MAX_TRACK_JUMP_PX:
+                self._confirm_count += 1
+                self._pending_x = self._pending_x * 0.6 + measured_x * 0.4
+                if self._confirm_count >= CONFIRM_DETECTIONS:
+                    self.state = self.TRACK
+                    self._x = self._pending_x
+                    self._misses = 0
+                return self._pending_x
+            self._pending_x = measured_x
+            self._confirm_count = 1
+            return self._pending_x
+
+        # TRACK / HOLD
+        if abs(measured_x - self._x) <= MAX_TRACK_JUMP_PX:
+            if self.state == self.HOLD:
+                self.state = self.TRACK
+            self._x = self._x * (1.0 - FILTER_ALPHA) + measured_x * FILTER_ALPHA
+            self._misses = 0
+        else:
+            self.miss()
+        return self._x
 
     def miss(self):
-        self.misses += 1
-
-    def use_local_roi(self):
-        return self.ready and self.misses < TRACK_MISS_LIMIT
+        self._misses += 1
+        if self.state == self.TRACK:
+            self.state = self.HOLD
+        elif self.state == self.HOLD and self._misses >= MISS_HOLD_DETECTIONS:
+            self.state = self.LOST
+            self._confirm_count = 0
 
 
 # ============ Video sender ============
@@ -322,7 +365,7 @@ def send_ball(valid, x_cm_x100, y_offset_px, quality, tracked):
     try:
         frame = build_vision_frame(uart_seq, valid, x_cm_x100,
                                    y_offset_px, quality, tracked)
-        uart.write(bytes(frame))
+        uart.write(frame)               # bytearray直接写入,不copy
         uart_seq = (uart_seq + 1) & 0xFF
     except Exception:
         pass
@@ -344,12 +387,19 @@ def _draw_stream_marker(canvas, marker, crop_offset=(0, 0)):
                       thickness=STREAM_OVERLAY_THICKNESS)
 
 
+# Pre-allocated video encode buffer — avoids per-frame img.copy() allocation
+_VIDEO_BUF = None  # created after sensor init (needs Display to be ready)
+
 def encode_video_jpeg(capture_img, vision_marker=None):
-    pipe_crop = capture_img.copy(roi=PIPE_VIDEO_CROP)
+    global _VIDEO_BUF
+    if _VIDEO_BUF is None:
+        _VIDEO_BUF = image.Image(VIDEO_W, VIDEO_H, image.RGB565)
+    # draw_image into pre-allocated buffer (zero-allocation copy)
+    _VIDEO_BUF.draw_image(capture_img, 0, 0, roi=PIPE_VIDEO_CROP)
     if STREAM_OVERLAY_ENABLE and vision_marker is not None:
-        _draw_stream_marker(pipe_crop, vision_marker,
+        _draw_stream_marker(_VIDEO_BUF, vision_marker,
                             crop_offset=(PIPE_VIDEO_CROP[0], PIPE_VIDEO_CROP[1]))
-    return bytes(pipe_crop.compress(quality=JPEG_Q))
+    return _VIDEO_BUF.compress(quality=JPEG_Q)
 
 
 # ============ Main ============
@@ -416,6 +466,14 @@ try:
 except Exception as e:
     print("[K230] YOLO model load FAILED:", e)
     raise
+# Disable YOLO library's draw_result — we don't use the IDE display, and its
+# deprecated draw_string() calls flood the REPL UART with warnings, causing
+# buffer stalls that slow the detection loop.
+try:
+    yolo.draw_result = lambda *a, **kw: None
+    print("[K230] YOLO draw_result disabled (saves CPU, avoids REPL spam)")
+except Exception:
+    pass
 print("[K230] YOLO11 model ready")
 
 # Start sensor + warm up
@@ -432,13 +490,12 @@ print("[K230] Sensor running, frames warm")
 print("[K230] Video pipe ROI {} -> {}x{} Q{} @{}fps".format(
     PIPE_VIDEO_CROP, VIDEO_W, VIDEO_H, JPEG_Q, VIDEO_TARGET_FPS))
 
-tracker = AlphaBetaTracker()
+tracker = BallTracker()
 video_sender = VideoSender()
 clock = time.clock()
 
 frame_index = 0
 last_video_enqueue_ms = 0
-last_pc_cool_ms = 0
 
 wlan = None
 try:
@@ -447,17 +504,10 @@ except Exception:
     pass
 
 pc_sock = None
-# IPC reconnection uses a dedicated cool-down so we don't hammer the PC.
-last_pc_cool_ms = 0
+last_pc_cool_ms = 0    # Wi-Fi reconnect cool-down
 
-video_stat_start_ms = time.ticks_ms()
 video_count = 0
 video_bytes = 0
-
-perf_cap_ms = 0
-perf_yolo_ms = 0
-perf_jpeg_ms = 0
-perf_send_ms = 0
 
 print("[K230] Running: YOLO NPU → UART; JPEG WiFi streaming")
 
@@ -465,14 +515,11 @@ while True:
     clock.tick()
     now_ms = time.ticks_ms()
 
-    # 1. Get AI frame from CHN_2 (RGBP888, 640x360)
-    cap_start = time.ticks_ms()
+    # 1. Get AI frame from CHN_2 (RGBP888, 640x480)
     ai_img = sensor.snapshot(chn=CAM_CHN_ID_2)
     ai_np = ai_img.to_numpy_ref()
-    perf_cap_ms += _ticks_diff(time.ticks_ms(), cap_start)
 
     # 2. YOLO NPU inference
-    yolo_start = time.ticks_ms()
     ball_valid = False
     ball_cx = 0.0
     ball_cy = 0.0
@@ -482,24 +529,27 @@ while True:
     if VISION_ENABLE:
         try:
             results = yolo.run(ai_np)
-        except Exception as e:
-            # IDE interrupt or transient error — skip this frame
+        except Exception:
             results = ([], [], [])
         if results and results[0]:
-            # Log ALL detections for debugging
-            det_info = []
+            # Find best detection INSIDE the pipe ROI
             best_idx = -1
             best_conf = 0.0
+            roi_x0, roi_y0, roi_w, roi_h = PIPE_ROI
+            roi_x1 = roi_x0 + roi_w
+            roi_y1 = roi_y0 + roi_h
             for i in range(len(results[0])):
                 score = float(results[2][i])
-                if score > CONF_THRESH:
-                    x, y, w, h = results[0][i]
-                    det_info.append("[{},{},{},{},c{}]".format(x,y,w,h,results[1][i]))
-                if score > best_conf:
-                    best_conf = score
-                    best_idx = i
-            if det_info and frame_index % 30 == 0:
-                print("[K230] dets({}): {}".format(len(det_info), " ".join(det_info)))
+                if score < best_conf:
+                    continue
+                x, y, w, h = results[0][i]
+                cx = float(x) + float(w) / 2.0
+                cy = float(y) + float(h) / 2.0
+                # Gate: ball center must be inside pipe ROI
+                if not (roi_x0 <= cx <= roi_x1 and roi_y0 <= cy <= roi_y1):
+                    continue
+                best_conf = score
+                best_idx = i
             if best_idx >= 0:
                 x, y, w, h = results[0][best_idx]
                 ball_cx = float(x) + float(w) / 2.0
@@ -508,9 +558,8 @@ while True:
                 box_w = int(w)
                 box_h = int(h)
                 ball_valid = True
-    perf_yolo_ms += _ticks_diff(time.ticks_ms(), yolo_start)
 
-    # 3. Tracking & UART
+    # 3. Tracking & UART (sends EVERY frame — this is the critical path)
     stream_marker = None
     if ball_valid:
         filtered_x = tracker.update(ball_cx, now_ms)
@@ -522,9 +571,14 @@ while True:
         send_ball(True, x_cm_x100, 0, quality, tracker.ready)
     else:
         tracker.miss()
-        send_ball(False, 0, 0, 0, tracker.ready)
+        if tracker.ready and tracker.misses < TRACK_MISS_LIMIT:
+            pred_x = tracker.predicted_x(now_ms)
+            pred_cm = pixel_to_cm(pred_x)
+            send_ball(True, int(round(pred_cm * 100.0)), 0, 40, True)
+        else:
+            send_ball(False, 0, 0, 0, False)
 
-    # 4. WiFi / streaming (non-blocking — detection always takes priority)
+    # 4. WiFi streaming (non-blocking, lower priority than detection+UART)
     wifi_ok = (wlan is not None) and wlan.isconnected()
     if pc_sock is None and wifi_ok:
         if _ticks_diff(now_ms, last_pc_cool_ms) >= PC_RETRY_MS:
@@ -535,65 +589,46 @@ while True:
     if (pc_sock is not None and not video_sender.pending() and
             _ticks_diff(now_ms, last_video_enqueue_ms) >= VIDEO_INTERVAL_MS):
         try:
-            jpeg_start = time.ticks_ms()
             stream_img = sensor.snapshot()  # CHN_0, RGB565
             jpeg = encode_video_jpeg(stream_img, stream_marker)
             video_sender.enqueue_payload(STREAM_CODEC_JPEG, jpeg)
-            perf_jpeg_ms += _ticks_diff(time.ticks_ms(), jpeg_start)
             last_video_enqueue_ms = now_ms
-        except Exception as e:
-            print("[K230] JPEG encode error:", e)
+        except Exception:
             video_sender.reset()
 
     if pc_sock is not None:
-        send_start = time.ticks_ms()
         completed_bytes, connection_stalled = video_sender.flush(pc_sock, now_ms)
-        perf_send_ms += _ticks_diff(time.ticks_ms(), send_start)
         if completed_bytes > 0:
             video_bytes += completed_bytes
             video_count += 1
         if connection_stalled:
-            print("[K230] video stalled ({}) — reconnect".format(
-                video_sender.stall_count()))
             try:
                 pc_sock.close()
             except Exception:
                 pass
             pc_sock = None
-            last_pc_cool_ms = now_ms  # don't reconnect immediately
+            last_pc_cool_ms = now_ms
             video_sender.reset()
 
-    # 6. Status & GC
+    # 6. GC — reduced allocations, run even less often
     frame_index += 1
-    if frame_index % 60 == 0:
+    if frame_index % 200 == 0:         # ~7 seconds
         try:
             gc.collect()
         except Exception:
             pass
 
-    if frame_index % 30 == 0:
+    # Status report (lightweight, every 120 frames ≈ 4s)
+    if frame_index % 120 == 0:
+        fps_now = clock.fps()
         if ball_valid:
-            state = "x={:.2f}cm cx={:.1f}px c={:.2f}".format(
-                x_cm_x100 / 100.0, ball_cx, ball_conf)
+            x_cm = pixel_to_cm(ball_cx)
+            print("[K230] {:.1f}fps x={:.2f}cm c={:.2f} [{}] uart:{}".format(
+                fps_now, x_cm, ball_conf, tracker.state_name(), uart_seq))
+        elif tracker.ready:
+            x_cm = pixel_to_cm(tracker.predicted_x(now_ms))
+            print("[K230] {:.1f}fps pred={:.2f}cm [{}] uart:{}".format(
+                fps_now, x_cm, tracker.state_name(), uart_seq))
         else:
-            state = "NO BALL"
-        stat_elapsed_ms = max(1, _ticks_diff(now_ms, video_stat_start_ms))
-        video_fps = video_count * 1000.0 / stat_elapsed_ms
-        video_kb_s = video_bytes * 1000.0 / stat_elapsed_ms / 1024.0
-        if PERFORMANCE_LOG:
-            print("[K230] Loop:{:.1f} {} UART:{} Video:{:.1f}fps {:.1f}KB/s "
-                  "ms/frame cap:{:.1f} yolo:{:.1f} enc:{:.1f} net:{:.1f}".format(
-                clock.fps(), state, uart_seq, video_fps, video_kb_s,
-                perf_cap_ms / 30.0, perf_yolo_ms / 30.0,
-                perf_jpeg_ms / 30.0, perf_send_ms / 30.0
-            ))
-        else:
-            print("[K230] Loop:{:.1f} {} UART:{} Video:{:.1f}fps {:.1f}KB/s".format(
-                clock.fps(), state, uart_seq, video_fps, video_kb_s))
-        video_stat_start_ms = now_ms
-        video_count = 0
-        video_bytes = 0
-        perf_cap_ms = 0
-        perf_yolo_ms = 0
-        perf_jpeg_ms = 0
-        perf_send_ms = 0
+            print("[K230] {:.1f}fps NO_BALL [{}] uart:{}".format(
+                fps_now, tracker.state_name(), uart_seq))
